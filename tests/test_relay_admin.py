@@ -188,3 +188,27 @@ def test_worker_env_keeps_one_token_per_instance(monkeypatch, tmp_path, capsys):
     assert "OTHER=kept" in lines and not any(l.startswith("JARVIS_RELAY_TOKEN=") for l in lines)
     (mapping,) = [l for l in lines if l.startswith("JARVIS_RELAY_TOKENS_JSON=")]
     assert json.loads(mapping.split("=", 1)[1]) == {"first": first, "second": second}
+
+
+def test_whoami_lets_a_client_verify_its_own_setup(monkeypatch, tmp_path, capsys):
+    relay = _load_relay(monkeypatch, tmp_path)
+    relay.main(["--set-owner", "first", "111"])
+    relay.main(["--add-token", "first"])
+    token = capsys.readouterr().out.strip()
+    relay._load_relay_config()
+    server = relay.ThreadingHTTPServer(("127.0.0.1", 0), relay.Queue)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/whoami"
+    try:
+        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=3) as response:
+            assert json.loads(response.read()) == {
+                "status": "ok", "instance_id": "first", "owner_registered": True,
+            }
+        assert _status(url, "wrong-token") == 401
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()

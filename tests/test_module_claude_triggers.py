@@ -25,6 +25,21 @@ def _install_import_stubs():
         pass
 
     loader = types.SimpleNamespace(Module=LoaderModule)
+
+    class ModuleConfig(dict):
+        """Stand-in for the framework's config: option -> current value."""
+        def __init__(self, *values):
+            super().__init__({value.option: value.default for value in values})
+
+    loader.ModuleConfig = ModuleConfig
+    loader.ConfigValue = lambda option, default=None, doc="", validator=None, on_change=None: (
+        types.SimpleNamespace(option=option, default=default, on_change=on_change)
+    )
+    loader.validators = types.SimpleNamespace(
+        String=lambda *args, **kwargs: None,
+        Hidden=lambda *args, **kwargs: None,
+        Integer=lambda *args, **kwargs: None,
+    )
     loader.tds = lambda value: value
     loader.watcher = lambda *args, **kwargs: (lambda value: value)
     loader.loop = lambda *args, **kwargs: (lambda value: value)

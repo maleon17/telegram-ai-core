@@ -902,7 +902,15 @@ class Queue(BaseHTTPRequestHandler):
                 self._error(404, "Артефакт не найден")
             return
 
-        if self.path.startswith("/persona") or self.path.startswith("/xpersona"):
+        if self.path == "/whoami":
+            # Connectivity probe for a client's "is my setup right?" check:
+            # reaching this line already proves the token is valid.
+            self._json({
+                "status": "ok", "instance_id": instance_id,
+                "owner_registered": bool(str(RELAY_OWNER_IDS.get(instance_id, "")).strip()),
+            })
+
+        elif self.path.startswith("/persona") or self.path.startswith("/xpersona"):
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
             if not self._query_instance_is_current(params, instance_id):

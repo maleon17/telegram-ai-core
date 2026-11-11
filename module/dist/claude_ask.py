@@ -1,4 +1,4 @@
-# GENERATED FILE -- do not edit. Built from telegram-ai-core module/ask_module.py.tmpl (sha256 a27676521af0);
+# GENERATED FILE -- do not edit. Built from telegram-ai-core module/ask_module.py.tmpl (sha256 e98703fc943e);
 # change the template there and run module/build.py.
 # ClaudeAsk — .ask .search .translate + Jarvis persona, Claude Code backend
 #
@@ -25,7 +25,7 @@
 #
 # GPL AGPLv3
 
-import asyncio, html, json, logging, os, re, secrets, shutil, subprocess, tempfile, time, urllib.request, urllib.parse, uuid
+import asyncio, html, json, logging, os, re, secrets, shutil, subprocess, tempfile, time, urllib.error, urllib.request, urllib.parse, uuid
 from datetime import datetime, timezone
 
 from herokutl.tl.functions.channels import ToggleForumRequest, InviteToChannelRequest, GetParticipantRequest
@@ -43,16 +43,24 @@ from herokutl.errors import FloodWaitError, UserPrivacyRestrictedError, UserNotP
 from .. import loader, utils
 from .._internal import fw_protect
 
+__version__ = (2, 0, 0)
+
 # Where the queue relay is and how to reach it. Nothing is assumed: a freshly
-# loaded module is unconfigured until .asknet stores these in the userbot
-# database (client_ready loads them back). The environment variables only
-# seed the initial values, for container images that prefer them.
-BACKEND_URL = os.environ.get("CLAUDE_JARVIS_BACKEND_URL", "")
+# loaded module is unconfigured until .asknet (or the .cfg editor) stores
+# these in the module config, and _apply_config() copies them here. The
+# environment variables only seed the initial values, for container images
+# that prefer them.
+_ENV_BACKEND_URL = os.environ.get("CLAUDE_JARVIS_BACKEND_URL", "")
+_ENV_HTTP_PROXY = os.environ.get("CLAUDE_JARVIS_HTTP_PROXY", "")
+_ENV_INSTANCE_ID = os.environ.get("CLAUDE_JARVIS_INSTANCE_ID", "")
+_ENV_RELAY_TOKEN = os.environ.get("CLAUDE_JARVIS_RELAY_TOKEN", "")
+BACKEND_URL = _ENV_BACKEND_URL
 # tailscaled on a userbot host without /dev/net/tun runs with
 # --tun=userspace-networking, so plain sockets never reach the tailnet: every
 # relay request then has to go through its local HTTP CONNECT proxy
 # (--outbound-http-proxy-listen=localhost:1056). Empty = connect directly.
-HTTP_PROXY = os.environ.get("CLAUDE_JARVIS_HTTP_PROXY", "")
+HTTP_PROXY = _ENV_HTTP_PROXY
+TAILNET_PROXY = "http://localhost:1056"
 
 
 def _make_relay_opener(proxy):
@@ -63,9 +71,24 @@ def _make_relay_opener(proxy):
 
 
 RELAY_OPENER = _make_relay_opener(HTTP_PROXY)
-INSTANCE_ID = os.environ.get("CLAUDE_JARVIS_INSTANCE_ID", "")
-RELAY_TOKEN = os.environ.get("CLAUDE_JARVIS_RELAY_TOKEN", "")
+INSTANCE_ID = _ENV_INSTANCE_ID
+RELAY_TOKEN = _ENV_RELAY_TOKEN
 ENGINE = "claude"
+
+
+def _configured():
+    """True once the module knows where the relay is and who it is."""
+    return bool(BACKEND_URL and INSTANCE_ID and RELAY_TOKEN)
+
+
+NOT_CONFIGURED_TEXT = (
+    "⚙️ <b>ClaudeAsk</b> ещё не настроен. В личном чате выполни:\n"
+    "<code>.asknet token &lt;token&gt;</code>\n"
+    "<code>.asknet local &lt;instance_id&gt;</code> — бэкенд на этом же хосте, или\n"
+    "<code>.asknet tailnet &lt;instance_id&gt; &lt;backend_url&gt;</code> — бэкенд в tailnet.\n"
+    "Токен и instance_id печатает setup.sh бэкенда. Проверка связи: "
+    "<code>.asknet check</code>"
+)
 MAX_ROUNDS = 5  # mirrors claude_watcher.py's own round discipline
 POLL_TIMEOUT_S = 600  # agentic file-editing tasks can genuinely take a while
 TELEGRAM_TEXT_LIMIT = 3500
@@ -119,10 +142,11 @@ TRIGGER_REQUESTER_PREFIX = "trigger:"
 TRIGGER_DEFAULT_ALLOWED_TOOLS = frozenset({"send_message"})
 HISTORY_TOOLS = frozenset({"search_chat", "read_history"})
 TRIGGER_LOCAL_SEND_TOOLS = frozenset({"send_message", "send_message_as_bot"})
-# The dedicated deployment/smoke channel is a trusted automation actor, not
-# a general user. It may exercise actions only in the owner's private chat;
-# a test-bot message in any other chat remains denied.
-TEST_CHANNEL_BOT_ID = 8747608932
+# Optional deployment/smoke channel (config test_bot_id, 0 = none): a bot the
+# owner drives for automated checks. A request it sends in its own private
+# chat with the owner's account is attributed to the owner; in any other chat
+# it is an ordinary sender. See _requester_for().
+TEST_CHANNEL_BOT_ID = 0
 INTERNAL_TOOL_RESULT_PREFIX = "[INTERNAL_TOOL_RESULT]"
 TOOL_PERMISSION_DENIAL = (
     f"{INTERNAL_TOOL_RESULT_PREFIX} Действие заблокировано: Telegram-действия "
@@ -136,15 +160,9 @@ TOOL_PERMISSION_DENIAL = (
 # generous free tier per the owner directly). Confirmed against Mistral's own
 # docs 2026-08-05, not guessed: POST multipart/form-data, model
 # voxtral-mini-latest, response JSON's "text" field holds the transcript.
-# No hardcoded default on purpose (this repo is a public git remote). A plain
-# env var does not survive a cold container restart on the Heroku-userbot
-# host -- the loader re-fetches this module fresh from its GitHub source on
-# every cold boot, and the env var itself is only ever set once at container
-# creation by the hosting panel, so any manual re-export is gone by the next
-# one. /data/ on that host is the one bind-mounted, persistent volume
-# (confirmed in BRIDGE_PROJECT_HANDOFF.md's Tailscale section) -- read the
-# real key from a file there first, so it survives both a module re-fetch
-# AND a full container reinstall.
+# The key comes from the module config (mistral_api_key). Two older sources
+# still work as fallbacks: /data/mistral_api_key.txt (a persistent volume on
+# container hosts) and the MISTRAL_API_KEY environment variable.
 def _load_mistral_api_key():
     try:
         with open("/data/mistral_api_key.txt", encoding="utf-8") as handle:
@@ -342,7 +360,107 @@ class _HeadlessReporter:
 
 @loader.tds
 class ClaudeAsk(loader.Module):
+    """Jarvis в твоих чатах на бэкенде Claude Code: .ask, .search, .translate, .new. Настройка сети: .asknet"""
+
     strings = {"name": "ClaudeAsk"}
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "backend_url", "",
+                "Адрес очереди (relay) бэкенда, например http://127.0.0.1:9092. "
+                "Проще задать через .asknet",
+                validator=loader.validators.String(),
+                on_change=self._apply_config,
+            ),
+            loader.ConfigValue(
+                "instance_id", "",
+                "Идентификатор этого юзербота на бэкенде (его печатает setup.sh)",
+                validator=loader.validators.String(),
+                on_change=self._apply_config,
+            ),
+            loader.ConfigValue(
+                "relay_token", "",
+                "Токен доступа к relay (его печатает setup.sh бэкенда)",
+                validator=loader.validators.Hidden(),
+                on_change=self._apply_config,
+            ),
+            loader.ConfigValue(
+                "http_proxy", "",
+                "HTTP-прокси до relay. Пусто — прямое соединение; для tailnet "
+                "без /dev/net/tun — http://localhost:1056",
+                validator=loader.validators.String(),
+                on_change=self._apply_config,
+            ),
+            loader.ConfigValue(
+                "mistral_api_key", "",
+                "Ключ Mistral для расшифровки голосовых (Voxtral). Пусто — "
+                "голосовые не расшифровываются",
+                validator=loader.validators.Hidden(),
+                on_change=self._apply_config,
+            ),
+            loader.ConfigValue(
+                "test_bot_id", 0,
+                "ID бота-тестового канала: его запросы в личном чате с тобой "
+                "выполняются с твоими правами. 0 — выключено",
+                validator=loader.validators.Integer(minimum=0),
+                on_change=self._apply_config,
+            ),
+            loader.ConfigValue(
+                "tailscale_hostname", "",
+                "Имя этого узла в tailnet. Пусто — userbot-<твой Telegram ID>",
+                validator=loader.validators.String(),
+            ),
+        )
+
+    def _apply_config(self):
+        """Copy the stored settings into the module-level values the request
+        code reads. Runs once the framework has loaded the config and again
+        whenever a value changes (.asknet or the .cfg editor)."""
+        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID, RELAY_TOKEN, RELAY_OPENER
+        global TEST_CHANNEL_BOT_ID, MISTRAL_API_KEY
+        config = self.config
+        BACKEND_URL = str(config["backend_url"] or _ENV_BACKEND_URL).strip().rstrip("/")
+        HTTP_PROXY = str(config["http_proxy"] or _ENV_HTTP_PROXY).strip()
+        INSTANCE_ID = str(config["instance_id"] or _ENV_INSTANCE_ID).strip()
+        RELAY_TOKEN = str(config["relay_token"] or _ENV_RELAY_TOKEN).strip()
+        RELAY_OPENER = _make_relay_opener(HTTP_PROXY)
+        try:
+            TEST_CHANNEL_BOT_ID = int(config["test_bot_id"] or 0)
+        except (TypeError, ValueError):
+            TEST_CHANNEL_BOT_ID = 0
+        MISTRAL_API_KEY = str(config["mistral_api_key"] or "").strip() or _load_mistral_api_key()
+
+    def _config_set(self, key, value):
+        """Store one setting now. The framework's own autosaver persists
+        config edits a little later; a restart in between must not lose a
+        freshly entered token."""
+        self.config[key] = value
+        try:
+            self.pointer("__config__", {})[key] = self.config[key]
+        except Exception:
+            pass
+
+    async def _requester_for(self, message):
+        """Who the relay should attribute an interactive request to: the
+        sender -- except the optional test channel, whose requests in its own
+        private chat with this account count as the owner's (owner-driven
+        automation). Everywhere else that bot is an ordinary sender."""
+        sender = getattr(message, "sender_id", None)
+        if (
+            TEST_CHANNEL_BOT_ID
+            and sender == TEST_CHANNEL_BOT_ID
+            and getattr(message, "chat_id", None) == TEST_CHANNEL_BOT_ID
+        ):
+            return await self._get_owner_id()
+        return sender
+
+    async def _require_config(self, work_message):
+        """False (after telling the user how to set up) while unconfigured."""
+        if _configured():
+            return True
+        await self._safe_edit(work_message, NOT_CONFIGURED_TEXT, parse_mode="html")
+        return False
     # A class attribute so self.TELEGRAM_TEXT_LIMIT resolves (it did not as
     # a bare module-level name -- confirmed live: every _dispatch_answer
     # call raised AttributeError before
@@ -358,8 +476,6 @@ class ClaudeAsk(loader.Module):
     # -- Forum topics (Phase 1 infra) -----------------------------------------
 
     async def client_ready(self):
-        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID, RELAY_TOKEN, RELAY_OPENER
-
         self._topics = {}
         self._owner_id_cache = None
         # chat_id -> asyncio.Lock, serializes action=agent/reply trigger
@@ -383,13 +499,18 @@ class ClaudeAsk(loader.Module):
         self._edited_trigger_tasks = {}
         # sid -> {pages, index, chat_id, code_msg_id, form} for the .persona pager
         self._persona_sessions = {}
-        network = self.db.get("ClaudeAsk", "network", None)
-        if isinstance(network, dict):
-            BACKEND_URL = network.get("backend_url", BACKEND_URL)
-            HTTP_PROXY = network.get("http_proxy", HTTP_PROXY)
-            INSTANCE_ID = network.get("instance_id", INSTANCE_ID)
-            RELAY_TOKEN = network.get("relay_token", RELAY_TOKEN)
-            RELAY_OPENER = _make_relay_opener(HTTP_PROXY)
+        # Versions before the module config kept these four values in one
+        # "network" dict; carry them over once so an update does not unset a
+        # working installation.
+        legacy = self.db.get("ClaudeAsk", "network", None)
+        if (
+            isinstance(legacy, dict)
+            and not self.config["backend_url"] and not self.config["relay_token"]
+        ):
+            for key in ("backend_url", "http_proxy", "instance_id", "relay_token"):
+                if legacy.get(key):
+                    self._config_set(key, legacy[key])
+        self._apply_config()
         await self._ensure_topics()
         # Same-host deployments do not need tailscaled and may not have its
         # binary installed. A live sibling deployment hit FileNotFoundError
@@ -528,10 +649,7 @@ class ClaudeAsk(loader.Module):
                 if tool in HISTORY_TOOLS:
                     return self._chat_arg_is_current(args.get("chat"), chat_id)
                 return True
-            return (
-                owner_authorized is None and owner_id is not None
-                and requester == str(TEST_CHANNEL_BOT_ID) and chat == str(owner_id)
-            )
+            return False
         except Exception:
             return False
 
@@ -3798,6 +3916,8 @@ class ClaudeAsk(loader.Module):
         context). Ticks every 2s regardless of message traffic, same
         pattern as bridge.py's own watcher threads (_restart_watcher_loop
         etc) -- @loader.loop is the Heroku-framework equivalent of that."""
+        if not _configured():
+            return
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(None, self._fetch_pending_tool_call)
@@ -4096,6 +4216,8 @@ class ClaudeAsk(loader.Module):
             orig_question = question
         if work_message is None:
             work_message = await self._work_message(message)
+        if not await self._require_config(work_message):
+            return
 
         if round_num == 0:
             reply_id = getattr(message, "reply_to_msg_id", None)
@@ -4194,7 +4316,7 @@ class ClaudeAsk(loader.Module):
             enqueued, enqueue_error = await self._enqueue_async(
                 question, chat_id, req_id, mode, topic_id=topic_id,
                 exclude_id=work_message.id,
-                requester_id=getattr(message, "sender_id", None),
+                requester_id=await self._requester_for(message),
             )
             if enqueued:
                 if round_num == 0:
@@ -4288,81 +4410,112 @@ class ClaudeAsk(loader.Module):
 
     # -- Commands -------------------------------------------------------------
 
+    def _relay_whoami(self):
+        """Blocking connectivity probe: (ok, human-readable verdict)."""
+        request = urllib.request.Request(f"{BACKEND_URL}/whoami", headers=_relay_headers())
+        try:
+            with self._relay_open(request, 8) as response:
+                data = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            if error.code == 401:
+                return False, "relay отвечает, но токен не подходит (401). Проверь <code>.asknet token</code>."
+            if error.code == 404:
+                return False, "по этому адресу отвечает не relay или его старая версия (404 на /whoami)."
+            return False, f"relay ответил ошибкой HTTP {error.code}."
+        except Exception as error:
+            hint = " Прокси tailnet не отвечает — см. <code>.asknet tailnet</code>." if HTTP_PROXY else ""
+            return False, f"нет связи с relay: {_h(str(error))}.{hint}"
+        relay_instance = str(data.get("instance_id") or "")
+        if relay_instance != INSTANCE_ID:
+            return False, (
+                f"токен принадлежит instance <code>{_h(relay_instance)}</code>, а здесь задан "
+                f"<code>{_h(INSTANCE_ID)}</code>. Исправь instance_id или токен."
+            )
+        return True, f"связь есть, relay узнал instance <code>{_h(relay_instance)}</code>."
+
     @loader.command()
     async def asknet(self, message):
-        """Настроить сеть ClaudeAsk для этого экземпляра"""
-        global BACKEND_URL, HTTP_PROXY, INSTANCE_ID, RELAY_TOKEN, RELAY_OPENER
-
+        """[local|tailnet|custom|token|check|testbot] — настройка сети ClaudeAsk (без аргументов — справка и текущие значения)"""
         usage = (
-            "<b>.asknet</b> — текущая конфигурация и справка\n"
-            "<code>.asknet local &lt;instance_id&gt;</code>\n"
-            "<code>.asknet tailnet &lt;instance_id&gt; &lt;backend_url&gt;</code>\n"
+            "<b>.asknet</b> — настройка связи с бэкендом\n"
+            "<code>.asknet token &lt;token&gt;</code> — токен relay (в личном чате!)\n"
+            "<code>.asknet local &lt;instance_id&gt;</code> — бэкенд на этом же хосте\n"
+            "<code>.asknet tailnet &lt;instance_id&gt; &lt;backend_url&gt;</code> — бэкенд в tailnet\n"
             "<code>.asknet custom &lt;instance_id&gt; &lt;backend_url&gt; &lt;proxy_url|none&gt;</code>\n"
-            "<code>.asknet token &lt;token&gt;</code>"
+            "<code>.asknet check</code> — проверить связь\n"
+            "<code>.asknet testbot &lt;id|off&gt;</code> — тестовый канал\n"
+            "Те же значения можно править в <code>.cfg ClaudeAsk</code>."
         )
 
         def config_text(prefix):
-            proxy = HTTP_PROXY or "disabled"
             return (
                 f"{prefix}\n"
-                f"instance_id: <code>{_h(INSTANCE_ID)}</code>\n"
-                f"backend_url: <code>{_h(BACKEND_URL)}</code>\n"
-                f"http_proxy: <code>{_h(proxy)}</code>\n"
-                f"relay_token: <code>{'configured' if RELAY_TOKEN else 'not configured'}</code>"
+                f"instance_id: <code>{_h(INSTANCE_ID or 'не задан')}</code>\n"
+                f"backend_url: <code>{_h(BACKEND_URL or 'не задан')}</code>\n"
+                f"http_proxy: <code>{_h(HTTP_PROXY or 'нет (прямое соединение)')}</code>\n"
+                f"relay_token: <code>{'задан' if RELAY_TOKEN else 'не задан'}</code>\n"
+                f"test_bot_id: <code>{TEST_CHANNEL_BOT_ID or 'выключен'}</code>"
             )
 
         args = utils.get_args_raw(message).split()
         work_message = await self._work_message(message)
         if not args:
-            await self._safe_edit(
-                work_message, config_text(usage), parse_mode="html"
-            )
+            await self._safe_edit(work_message, config_text(usage), parse_mode="html")
             return
+        mode = args[0].lower()
 
-        if args[0].lower() == "token" and len(args) == 2:
-            RELAY_TOKEN = args[1]
-            self.db.set("ClaudeAsk", "network", {
-                "instance_id": INSTANCE_ID,
-                "backend_url": BACKEND_URL,
-                "http_proxy": HTTP_PROXY,
-                "relay_token": RELAY_TOKEN,
-            })
+        if mode == "token" and len(args) == 2:
+            self._config_set("relay_token", args[1])
+            self._apply_config()
             await self._safe_edit(work_message, "✅ Relay token сохранён (значение скрыто).", parse_mode="html")
             return
 
-        mode = args[0].lower()
+        if mode == "check" and len(args) == 1:
+            if not await self._require_config(work_message):
+                return
+            ok, verdict = await asyncio.get_running_loop().run_in_executor(None, self._relay_whoami)
+            await self._safe_edit(work_message, f"{'✅' if ok else '❌'} {verdict}", parse_mode="html")
+            return
+
+        if mode == "testbot" and len(args) == 2:
+            value = args[1].lower()
+            if value in ("off", "none", "0"):
+                bot_id = 0
+            elif value.isdigit():
+                bot_id = int(value)
+            else:
+                await self._safe_edit(work_message, usage, parse_mode="html")
+                return
+            self._config_set("test_bot_id", bot_id)
+            self._apply_config()
+            await self._safe_edit(
+                work_message,
+                f"✅ Тестовый канал: <code>{bot_id or 'выключен'}</code>", parse_mode="html",
+            )
+            return
+
         if mode == "local" and len(args) == 2:
-            instance_id, backend_url, http_proxy = (
-                args[1], "http://127.0.0.1:9092", None
-            )
+            instance_id, backend_url, http_proxy = args[1], "http://127.0.0.1:9092", ""
         elif mode == "tailnet" and len(args) == 3:
-            instance_id, backend_url, http_proxy = (
-                args[1], args[2], "http://localhost:1056"
-            )
+            instance_id, backend_url, http_proxy = args[1], args[2], TAILNET_PROXY
         elif mode == "custom" and len(args) == 4:
             instance_id, backend_url = args[1], args[2]
-            http_proxy = None if args[3].lower() == "none" else args[3]
+            http_proxy = "" if args[3].lower() == "none" else args[3]
         else:
             await self._safe_edit(work_message, usage, parse_mode="html")
             return
 
-        if not instance_id or not backend_url.startswith(("http://", "https://")):
+        if (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", instance_id)
+            or not backend_url.startswith(("http://", "https://"))
+        ):
             await self._safe_edit(work_message, usage, parse_mode="html")
             return
 
-        BACKEND_URL = backend_url
-        HTTP_PROXY = http_proxy
-        INSTANCE_ID = instance_id
-        self.db.set(
-            "ClaudeAsk", "network",
-            {
-                "instance_id": INSTANCE_ID,
-                "backend_url": BACKEND_URL,
-                "http_proxy": HTTP_PROXY,
-                "relay_token": RELAY_TOKEN,
-            },
-        )
-        RELAY_OPENER = _make_relay_opener(HTTP_PROXY)
+        self._config_set("instance_id", instance_id)
+        self._config_set("backend_url", backend_url)
+        self._config_set("http_proxy", http_proxy)
+        self._apply_config()
         await self._safe_edit(
             work_message, config_text("✅ Сетевая конфигурация применена:"),
             parse_mode="html",
@@ -4427,6 +4580,8 @@ class ClaudeAsk(loader.Module):
         """Очистить историю диалога и начать новую сессию"""
         chat_id = message.chat_id
         work_message = await self._work_message(message)
+        if not await self._require_config(work_message):
+            return
         # Clear the rolling-history anchor along with the session -- Claude's
         # own memory of the chat is gone too now, so the next .ask should
         # fall back to a full fixed-window fetch, not "just what's new since
