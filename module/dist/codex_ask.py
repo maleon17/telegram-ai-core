@@ -1,4 +1,4 @@
-# GENERATED FILE -- do not edit. Built from telegram-ai-core module/ask_module.py.tmpl (sha256 e98703fc943e);
+# GENERATED FILE -- do not edit. Built from telegram-ai-core module/ask_module.py.tmpl (sha256 b05a959f9f78);
 # change the template there and run module/build.py.
 # CodexAsk — .xask .xsearch .xtranslate + Jarvis persona, Codex backend
 #
@@ -74,6 +74,16 @@ RELAY_OPENER = _make_relay_opener(HTTP_PROXY)
 INSTANCE_ID = _ENV_INSTANCE_ID
 RELAY_TOKEN = _ENV_RELAY_TOKEN
 ENGINE = "codex"
+
+
+# What a wait loop returns in place of an answer when the request was stopped
+# with .xstop: never a backend failure, so it must not trigger the
+# sibling-engine fallback or a "no answer" report.
+CANCELLED = object()
+STOPPED_TEXT = "⏹ Остановлено."
+STOPPED_UNCONFIRMED_TEXT = (
+    "⏹ Остановлено здесь, но бэкенд не подтвердил отмену — запрос мог доработать до конца."
+)
 
 
 def _configured():
@@ -365,6 +375,11 @@ class CodexAsk(loader.Module):
     strings = {"name": "CodexAsk"}
 
     def __init__(self):
+        # request_id -> {"chat_id", "work_message_id", "cancel_error"} for every
+        # request this module is currently waiting on, and the ids that
+        # .xstop has asked to abandon.
+        self._active_requests = {}
+        self._cancelled_requests = set()
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
                 "backend_url", "",
@@ -1643,6 +1658,8 @@ class CodexAsk(loader.Module):
         deadline = time.monotonic() + POLL_TIMEOUT_S
         while time.monotonic() < deadline:
             await asyncio.sleep(min(sleep_s, max(0, deadline - time.monotonic())))
+            if req_id in self._cancelled_requests:
+                return message, CANCELLED, [], []
             if time.monotonic() >= deadline:
                 break
             try:
@@ -1669,6 +1686,8 @@ class CodexAsk(loader.Module):
             if d.get("request_id") is not None and d.get("request_id") != req_id:
                 continue
             if d.get("done"):
+                if d.get("cancelled"):
+                    return message, CANCELLED, [], []
                 return message, d.get("answer"), (d.get("thoughts") or []), (d.get("generated_image_paths") or [])
             progress = d.get("progress")
             if progress and progress != last_progress:
@@ -3134,16 +3153,16 @@ class CodexAsk(loader.Module):
                 # handing an autonomous trigger to an unsafe implementation.
                 return
             self._commit_trigger_context_anchor(context_anchor)
-            answer = None
-            for _ in range(60):
-                await asyncio.sleep(1)
-                try:
-                    d = await asyncio.get_event_loop().run_in_executor(None, self._fetch_ask_status, req_id)
-                except Exception:
-                    continue
-                if isinstance(d, dict) and d.get("request_id") == req_id and d.get("done"):
-                    answer = d.get("answer")
-                    break
+            self._active_requests[req_id] = {"chat_id": str(message.chat_id), "work_message_id": None}
+            try:
+                answer, _thoughts = await self._poll_result_silent(req_id, timeout_s=60)
+            finally:
+                self._finish_request(req_id)
+        if answer is CANCELLED:
+            await self._notify_topic(
+                "moderation", f"⏹ Автоответ по триггеру [{_h(trig.get('id', '?'))}] остановлен командой .xstop.",
+            )
+            return True
         if not answer or self._backend_failed(answer):
             await self._notify_topic("moderation", "⚠️ Автоответ по триггеру не дождался ответа агента.")
             return False
@@ -3176,11 +3195,15 @@ class CodexAsk(loader.Module):
         loop = asyncio.get_running_loop()
         for _ in range(timeout_s):
             await asyncio.sleep(1)
+            if req_id in self._cancelled_requests:
+                return CANCELLED, []
             try:
                 d = await loop.run_in_executor(None, self._fetch_ask_status, req_id)
             except Exception:
                 continue
             if isinstance(d, dict) and d.get("request_id") == req_id and d.get("done"):
+                if d.get("cancelled"):
+                    return CANCELLED, []
                 return d.get("answer"), (d.get("thoughts") or [])
         return None, []
 
@@ -3375,7 +3398,16 @@ class CodexAsk(loader.Module):
                 # handing an autonomous trigger to an unsafe implementation.
                 return
             self._commit_trigger_context_anchor(context_anchor)
-            answer, thoughts = await self._poll_result_silent(req_id)
+            self._active_requests[req_id] = {"chat_id": str(message.chat_id), "work_message_id": None}
+            try:
+                answer, thoughts = await self._poll_result_silent(req_id)
+            finally:
+                self._finish_request(req_id)
+            if answer is CANCELLED:
+                await self._notify_topic(
+                    "moderation", f"⏹ Триггер [{_h(trig.get('id', '?'))}] (agent) остановлен командой .xstop.",
+                )
+                return True
             if answer is None or self._backend_failed(answer):
                 await self._notify_topic(
                     "moderation", f"⚠️ Триггер [{_h(trig.get('id', '?'))}] (agent) не дождался ответа.",
@@ -4309,6 +4341,7 @@ class CodexAsk(loader.Module):
         # of inline-message tricks gets around that, it's a hard Bot-API
         # chat-access requirement, not a formatting/schema issue.
         answer, thoughts, generated_image_paths = [None, [], []]
+        stopped = {}
         topic_id = self._topic_of(message)
         enqueued = False
         enqueue_error = ""
@@ -4322,9 +4355,24 @@ class CodexAsk(loader.Module):
                 if round_num == 0:
                     self._commit_history_anchor(pending_anchor)
                 enqueued = True
-                work_message, answer, thoughts, generated_image_paths = await self._poll_progress_and_result(
-                    work_message, req_id, animate=animate,
-                )
+                self._active_requests[req_id] = {
+                    "chat_id": str(chat_id), "work_message_id": getattr(work_message, "id", None),
+                }
+                try:
+                    work_message, answer, thoughts, generated_image_paths = await self._poll_progress_and_result(
+                        work_message, req_id, animate=animate,
+                    )
+                finally:
+                    stopped = self._finish_request(req_id)
+
+        if answer is CANCELLED:
+            note = STOPPED_UNCONFIRMED_TEXT if stopped.get("cancel_error") else STOPPED_TEXT
+            await self._safe_edit(
+                work_message,
+                f"<blockquote>💬 {_h(orig_question)}</blockquote>\n<blockquote>{note}</blockquote>",
+                parse_mode="html",
+            )
+            return
 
         if allow_fallback and self._backend_failed(answer):
             fallback = self._fallback_backend()
@@ -4409,6 +4457,48 @@ class CodexAsk(loader.Module):
             prefix = ""
 
     # -- Commands -------------------------------------------------------------
+
+    def _finish_request(self, req_id):
+        """Forget a request this module was waiting on; returns its record."""
+        self._cancelled_requests.discard(req_id)
+        return self._active_requests.pop(req_id, None) or {}
+
+    def _cancel_on_relay(self, req_id):
+        """Blocking: ask the backend to stop working on one request."""
+        data = json.dumps({"request_id": req_id, "instance_id": INSTANCE_ID}).encode()
+        request = urllib.request.Request(
+            f"{BACKEND_URL}/xcancel", data=data,
+            headers=_relay_headers("application/json"), method="POST",
+        )
+        with self._relay_open(request, 5) as response:
+            return json.loads(response.read())
+
+    @loader.command()
+    async def xstop(self, message):
+        """Остановить запрос Jarvis (Codex) в этом чате (ответом на его сообщение — только этот запрос)"""
+        chat = str(message.chat_id)
+        in_chat = [req for req, info in self._active_requests.items() if info["chat_id"] == chat]
+        reply_id = getattr(message, "reply_to_msg_id", None)
+        replied = [req for req in in_chat if reply_id and self._active_requests[req]["work_message_id"] == reply_id]
+        targets = replied or in_chat
+        if not targets:
+            work_message = await self._work_message(message)
+            await self._safe_edit(work_message, "⏹ В этом чате сейчас нечего останавливать.")
+            return
+        loop = asyncio.get_running_loop()
+        for req_id in targets:
+            # Stop the backend first, so the message can say truthfully
+            # whether the work really ended or only stopped being shown.
+            try:
+                await loop.run_in_executor(None, self._cancel_on_relay, req_id)
+            except Exception:
+                if req_id in self._active_requests:
+                    self._active_requests[req_id]["cancel_error"] = True
+            self._cancelled_requests.add(req_id)
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
     def _relay_whoami(self):
         """Blocking connectivity probe: (ok, human-readable verdict)."""
