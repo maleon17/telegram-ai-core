@@ -176,6 +176,14 @@ def main(argv=None):
                 continue
             changed = _write(os.path.join(checkout, values["OUTPUT"]), modules[values["OUTPUT"]])
             print(f"{'installed' if changed else 'unchanged'} {os.path.join(checkout, values['OUTPUT'])}")
+            # The coordinator is distributed from the product checkouts too
+            # (their raw URLs are what users feed to .dlm); keep those copies
+            # identical to the canonical one here.
+            coordinator = os.path.join(checkout, "jarvis_ask.py")
+            if os.path.isfile(coordinator):
+                with open(os.path.join(HERE, "jarvis_ask.py"), encoding="utf-8") as handle:
+                    changed = _write(coordinator, handle.read())
+                print(f"{'installed' if changed else 'unchanged'} {coordinator}")
     return 0
 
 

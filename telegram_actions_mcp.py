@@ -48,7 +48,7 @@ POLL_INTERVAL_S = 0.5
 # ClaudeAsk historically injects CHAT_ID/INSTANCE_ID.  Codex uses the
 # dedicated names because its static Codex config may still contain the
 # owner's legacy values; prefer the dynamic per-process context when present.
-INSTANCE_ID = os.environ.get("CODEX_TELEGRAM_INSTANCE_ID") or os.environ.get("INSTANCE_ID", "andrey")
+INSTANCE_ID = os.environ.get("CODEX_TELEGRAM_INSTANCE_ID") or os.environ.get("INSTANCE_ID", "")
 CHAT_ID = os.environ.get("CODEX_TELEGRAM_CHAT_ID") or os.environ.get("CHAT_ID", "")
 REQUESTER_ID = os.environ.get("CODEX_TELEGRAM_REQUESTER_ID") or os.environ.get("REQUESTER_ID", "")
 CONTEXT_DIR = os.environ.get("CODEX_TELEGRAM_CONTEXT_DIR")

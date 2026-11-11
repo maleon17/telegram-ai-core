@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Optional last step of a ClaudeAsk / CodexAsk install: put a userbot next to
+# the backend (a local Docker container running Heroku), or prepare this host
+# for a userbot that lives elsewhere and reaches it over Tailscale.
+#
+#   setup_userbot_network.sh claude_ask.py | codex_ask.py
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -48,10 +53,10 @@ setup_local_userbot() {
             cp "$REPO_ROOT/deploy/userbot/$template" "$project_dir/$template"
         fi
     done
-    cp "$REPO_ROOT/$MODULE_NAME" "$project_dir/modules/$MODULE_CLASS.py"
-    if [[ "$MODULE_CLASS" == CodexAsk ]]; then
-        cp "$REPO_ROOT/jarvis_ask.py" "$project_dir/modules/JarvisAsk.py"
-    fi
+    cp "$REPO_ROOT/module/dist/$MODULE_NAME" "$project_dir/modules/$MODULE_CLASS.py"
+    # The coordinator makes one incoming message fire one action when both
+    # ClaudeAsk and CodexAsk end up loaded; alone it is inert.
+    cp "$REPO_ROOT/module/jarvis_ask.py" "$project_dir/modules/JarvisAsk.py"
     compose() {
         "${docker_cmd[@]}" compose --env-file "$project_dir/.env" \
             --project-directory "$project_dir" -f "$project_dir/compose.yaml" \
