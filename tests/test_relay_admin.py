@@ -206,6 +206,7 @@ def test_whoami_lets_a_client_verify_its_own_setup(monkeypatch, tmp_path, capsys
         with opener.open(request, timeout=3) as response:
             assert json.loads(response.read()) == {
                 "status": "ok", "instance_id": "first", "owner_registered": True,
+                "role": "userbot",
             }
         assert _status(url, "wrong-token") == 401
     finally:

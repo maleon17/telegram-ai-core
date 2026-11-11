@@ -192,3 +192,35 @@ def test_test_channel_is_off_by_default_and_scoped_to_its_own_chat(ask):
     assert run(bot._tool_request_is_authorized(
         str(stranger_bot), "1000", "send_message", {"target": "x"}, owner_authorized=None,
     )) is False
+
+
+def test_a_call_without_a_chat_must_name_its_target(ask):
+    """A direct call (the owner acting from a bridge) has no current chat."""
+    module, bot = ask.module, ask.bot
+    run(ask.command("asknet")(message("token t")))
+    run(ask.command("asknet")(message("local mybot")))
+    results = []
+    bot._post_tool_call_result = lambda request_id, result: results.append(result)
+    bot._list_chat_members_action = AsyncMock(return_value="members")
+    bot._send_message_action = AsyncMock(return_value="✅ sent")
+    bot._delete_messages_action = AsyncMock(return_value="deleted")
+    bot._mark_sent_message = Mock()
+
+    def pending(tool, args):
+        bot._fetch_pending_tool_call = Mock(return_value={
+            "request_id": "r", "tool": tool, "args": args, "chat_id": "", "direct": True,
+            "requester_id": "1000", "owner_authorized": True,
+        })
+        run(bot.tool_call_watcher())
+        return results[-1]
+
+    answer = pending("list_chat_members", {})
+    assert answer.startswith(module.INTERNAL_TOOL_RESULT_PREFIX) and "«chat»" in answer
+    bot._list_chat_members_action.assert_not_called()
+    assert pending("list_chat_members", {"chat": "@friends"}) == "members"
+
+    answer = pending("delete_messages", {"ids": [1]})
+    assert answer.startswith(module.INTERNAL_TOOL_RESULT_PREFIX)
+    bot._delete_messages_action.assert_not_called()
+
+    assert pending("send_message", {"target": "@friend", "text": "hi"}) == "✅ sent"

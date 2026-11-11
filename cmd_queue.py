@@ -113,6 +113,13 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 # never written to this repository or to a queue item.
 RELAY_TOKENS = {}
 RELAY_OWNER_IDS = {}
+# Tokens of a second, narrower kind: issued to a Telegram bridge so that the
+# owner of an instance can use that instance's Telegram actions from their
+# own bridge chat. A bridge token can only place tool calls (always as the
+# instance's owner) and read their results -- never read a chat's requests,
+# personas or another client's tool calls. Same {sha256(token): instance_id}
+# layout, in relay-bridge-tokens.json; the file is optional.
+RELAY_BRIDGE_TOKENS = {}
 RELAY_STATE_DIR = _state_dir("JARVIS_RELAY_STATE_DIR", "relay_state")
 ARTIFACT_DIR = _state_dir("JARVIS_RELAY_ARTIFACT_DIR", "artifacts")
 
@@ -133,6 +140,11 @@ def _relay_tokens_file():
 def _relay_owners_file():
     return os.environ.get("JARVIS_RELAY_OWNERS_FILE") or os.path.join(
         _relay_config_dir(), "relay-owners.json")
+
+
+def _relay_bridge_tokens_file():
+    return os.environ.get("JARVIS_RELAY_BRIDGE_TOKENS_FILE") or os.path.join(
+        _relay_config_dir(), "relay-bridge-tokens.json")
 
 
 # (tokens mtime_ns, owners mtime_ns) of the maps currently loaded, so a token
@@ -157,16 +169,21 @@ def _load_mapping(path, label):
 
 def _relay_config_stamp():
     try:
+        bridge_stamp = os.stat(_relay_bridge_tokens_file()).st_mtime_ns
+    except OSError:
+        bridge_stamp = None  # optional file
+    try:
         return (
             os.stat(_relay_tokens_file()).st_mtime_ns,
             os.stat(_relay_owners_file()).st_mtime_ns,
+            bridge_stamp,
         )
     except OSError:
         return None
 
 
 def _load_relay_config():
-    global RELAY_TOKENS, RELAY_OWNER_IDS, _RELAY_CONFIG_STAMP
+    global RELAY_TOKENS, RELAY_OWNER_IDS, RELAY_BRIDGE_TOKENS, _RELAY_CONFIG_STAMP
     stamp = _relay_config_stamp()
     tokens = _load_mapping(_relay_tokens_file(), "JARVIS_RELAY_TOKENS_FILE")
     owners = _load_mapping(_relay_owners_file(), "JARVIS_RELAY_OWNERS_FILE")
@@ -179,7 +196,28 @@ def _load_relay_config():
         if instance_id not in owners or not str(owners[instance_id]).strip():
             raise RuntimeError(f"JARVIS_RELAY_OWNERS_FILE: нет owner id для instance {instance_id!r}")
         checked_tokens[digest] = instance_id
+    bridge_tokens = {}
+    try:
+        with open(_relay_bridge_tokens_file(), encoding="utf-8") as handle:
+            raw_bridge = json.load(handle)
+    except FileNotFoundError:
+        raw_bridge = {}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"JARVIS_RELAY_BRIDGE_TOKENS_FILE: не удалось прочитать: {exc}") from exc
+    if not isinstance(raw_bridge, dict):
+        raise RuntimeError("JARVIS_RELAY_BRIDGE_TOKENS_FILE: ожидался JSON-объект")
+    for digest, instance_id in raw_bridge.items():
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError("JARVIS_RELAY_BRIDGE_TOKENS_FILE: ключи должны быть sha256(token) в hex")
+        if not _safe_instance_id(instance_id) or not str(owners.get(instance_id, "")).strip():
+            # A bridge token acts as the instance's owner; without a
+            # registered owner there is nobody for it to act as.
+            raise RuntimeError(f"JARVIS_RELAY_BRIDGE_TOKENS_FILE: у instance {instance_id!r} нет владельца")
+        if digest in checked_tokens:
+            raise RuntimeError("JARVIS_RELAY_BRIDGE_TOKENS_FILE: токен уже выдан юзерботу")
+        bridge_tokens[digest] = instance_id
     RELAY_TOKENS = checked_tokens
+    RELAY_BRIDGE_TOKENS = bridge_tokens
     RELAY_OWNER_IDS = {str(key): str(value) for key, value in owners.items()}
     _RELAY_CONFIG_STAMP = stamp
 
@@ -738,23 +776,35 @@ class Queue(BaseHTTPRequestHandler):
             if not _safe_request_id(req_id):
                 self._json({"status": "error", "message": "Некорректный request_id"})
                 return
-            parent_request_id = body.get("parent_request_id", "")
-            parent = next(
-                (
-                    record for record in (
-                        _request_record("ask", parent_request_id),
-                        _request_record("xask", parent_request_id),
-                    )
-                    if record and hmac.compare_digest(str(record.get("instance_id", "")), instance_id)
-                ),
-                None,
-            )
-            if not parent:
+            direct = self.bridge_token
+            if direct:
+                # No chat request stands behind a bridge's call: it is the
+                # instance's owner acting from their own bridge chat. Who
+                # that is comes from the owners map, never from the caller.
+                parent = {
+                    "requester_id": str(RELAY_OWNER_IDS.get(instance_id, "")),
+                    "owner_authorized": True,
+                }
+            else:
+                parent_request_id = body.get("parent_request_id", "")
+                parent = next(
+                    (
+                        record for record in (
+                            _request_record("ask", parent_request_id),
+                            _request_record("xask", parent_request_id),
+                        )
+                        if record and hmac.compare_digest(str(record.get("instance_id", "")), instance_id)
+                    ),
+                    None,
+                )
+            if not parent or not parent.get("requester_id"):
                 self._error(403, "Запрос инструмента не принадлежит instance")
                 return
             call_data = {
                 "instance_id": instance_id,
-                "chat_id": body.get("chat_id", ""),
+                # A direct call has no "current chat" to default to.
+                "direct": direct,
+                "chat_id": "" if direct else body.get("chat_id", ""),
                 "tool": body.get("tool", ""),
                 "args": body.get("args", {}),
                 "requester_id": parent.get("requester_id", ""),
@@ -967,6 +1017,7 @@ class Queue(BaseHTTPRequestHandler):
             self._json({
                 "status": "ok", "instance_id": instance_id,
                 "owner_registered": bool(str(RELAY_OWNER_IDS.get(instance_id, "")).strip()),
+                "role": "bridge" if self.bridge_token else "userbot",
             })
 
         elif self.path.startswith("/persona") or self.path.startswith("/xpersona"):
@@ -1066,16 +1117,31 @@ class Queue(BaseHTTPRequestHandler):
             return None
         digest = hashlib.sha256(value[7:].encode("utf-8")).hexdigest()
         matched = None
+        self.bridge_token = False
         # Do not use a direct dictionary lookup for a credential comparison.
         # All configured digests have the same fixed length, so every compare
         # is constant-time with respect to the token value.
         for stored_digest, candidate_instance in RELAY_TOKENS.items():
             if hmac.compare_digest(digest, stored_digest):
                 matched = candidate_instance
+        for stored_digest, candidate_instance in RELAY_BRIDGE_TOKENS.items():
+            if hmac.compare_digest(digest, stored_digest):
+                matched = candidate_instance
+                self.bridge_token = True
         if matched is None:
             self._error(401, "Недействительный relay token")
             return None
+        if self.bridge_token and not self._bridge_may_use(self.command, self.path):
+            self._error(403, "Этот токен выдан бриджу: доступны только вызовы Telegram-действий")
+            return None
         return matched
+
+    @staticmethod
+    def _bridge_may_use(method, path):
+        """The whole surface a bridge token can reach."""
+        if method == "POST":
+            return path in ("/tool_call", "/artifact")
+        return path == "/whoami" or path.startswith("/tool_call?")
 
     def _body_instance_is_current(self, body, instance_id):
         if "instance_id" in body and not hmac.compare_digest(str(body["instance_id"]), instance_id):
@@ -1210,6 +1276,30 @@ def _merge_worker_token(env_file, instance_id, token):
         os.chown(env_file, owner.st_uid, owner.st_gid)
 
 
+def _add_bridge_token(instance_id):
+    """Mint a bridge token for an instance that has a registered owner."""
+    if not _safe_instance_id(instance_id):
+        raise RuntimeError("Некорректный instance_id")
+    owners = _read_mapping_for_edit(_relay_owners_file(), "JARVIS_RELAY_OWNERS_FILE")
+    if not str(owners.get(instance_id, "")).strip():
+        raise RuntimeError(f"У instance {instance_id!r} нет зарегистрированного владельца")
+    path = _relay_bridge_tokens_file()
+    entries = _read_mapping_for_edit(path, "JARVIS_RELAY_BRIDGE_TOKENS_FILE")
+    token = secrets.token_urlsafe(32)
+    entries[hashlib.sha256(token.encode("utf-8")).hexdigest()] = instance_id
+    _write_private_mapping(path, entries)
+    return token
+
+
+def _instances_owned_by(owner_id):
+    """Instance ids whose registered owner is this Telegram id, sorted."""
+    owners = _read_mapping_for_edit(_relay_owners_file(), "JARVIS_RELAY_OWNERS_FILE")
+    return sorted(
+        instance_id for instance_id, owner in owners.items()
+        if str(owner).strip() == str(owner_id).strip() and _safe_instance_id(instance_id)
+    )
+
+
 def _set_owner(instance_id, owner_id):
     if not _safe_instance_id(instance_id):
         raise RuntimeError("Некорректный instance_id")
@@ -1231,6 +1321,12 @@ def _revoke_tokens(instance_id):
     removed = len(entries) - len(kept)
     if removed:
         _write_private_mapping(path, kept)
+    bridge_path = _relay_bridge_tokens_file()
+    bridge_entries = _read_mapping_for_edit(bridge_path, "JARVIS_RELAY_BRIDGE_TOKENS_FILE")
+    bridge_kept = {digest: value for digest, value in bridge_entries.items() if value != instance_id}
+    if len(bridge_kept) != len(bridge_entries):
+        removed += len(bridge_entries) - len(bridge_kept)
+        _write_private_mapping(bridge_path, bridge_kept)
     return removed
 
 
@@ -1238,17 +1334,23 @@ def _list_instances():
     """Human-readable summary; never prints a token or a full digest."""
     tokens = _read_mapping_for_edit(_relay_tokens_file(), "JARVIS_RELAY_TOKENS_FILE")
     owners = _read_mapping_for_edit(_relay_owners_file(), "JARVIS_RELAY_OWNERS_FILE")
+    bridge = _read_mapping_for_edit(_relay_bridge_tokens_file(), "JARVIS_RELAY_BRIDGE_TOKENS_FILE")
     lines = []
     for instance_id in sorted(set(tokens.values()) | set(owners)):
         count = sum(1 for value in tokens.values() if value == instance_id)
-        lines.append(f"{instance_id}\towner={owners.get(instance_id, '-')}\ttokens={count}")
+        bridge_count = sum(1 for value in bridge.values() if value == instance_id)
+        lines.append(
+            f"{instance_id}\towner={owners.get(instance_id, '-')}\ttokens={count}"
+            + (f"\tbridge_tokens={bridge_count}" if bridge_count else "")
+        )
     return "\n".join(lines) or "(no instances)"
 
 
 _USAGE = (
     "Использование: cmd_queue.py [--check-config | --list | "
     "--add-token <instance_id> [--worker-env <file>] | "
-    "--set-owner <instance_id> <telegram_id> | --revoke-tokens <instance_id>]"
+    "--set-owner <instance_id> <telegram_id> | --revoke-tokens <instance_id> | "
+    "--add-bridge-token <instance_id> | --owned-by <telegram_id>]"
 )
 
 
@@ -1270,6 +1372,13 @@ def main(argv=None):
         if len(argv) == 4:
             _merge_worker_token(argv[3], argv[1], token)
         print(token)  # printed once; the relay itself persists only its hash
+        return 0
+    if command == "--add-bridge-token" and len(argv) == 2:
+        print(_add_bridge_token(argv[1]))
+        return 0
+    if command == "--owned-by" and len(argv) == 2:
+        for instance_id in _instances_owned_by(argv[1]):
+            print(instance_id)
         return 0
     if command == "--set-owner" and len(argv) == 3:
         _set_owner(argv[1], argv[2])

@@ -59,6 +59,16 @@ EXCLUDE_MSG_ID = int(os.environ.get("CODEX_TELEGRAM_EXCLUDE_MSG_ID") or os.envir
     os.environ.get("CODEX_TELEGRAM_EXCLUDE_MSG_ID") or os.environ.get("EXCLUDE_MSG_ID")
 ) else None
 
+# Direct mode: this server runs inside a Telegram bridge (not inside a chat
+# request), authenticated with a bridge token that acts as the instance's
+# owner. There is no "current chat" then -- in particular the CHAT_ID a
+# bridge exports is its own bot chat, not a chat of the userbot -- so every
+# chat-relative default is switched off and tools need an explicit target.
+DIRECT = os.environ.get("JARVIS_RELAY_DIRECT") == "1"
+if DIRECT:
+    CHAT_ID = REQUESTER_ID = ""
+    CONTEXT_DIR = TOPIC_ID = EXCLUDE_MSG_ID = None
+
 mcp = MCPServer("telegram-actions")
 
 
