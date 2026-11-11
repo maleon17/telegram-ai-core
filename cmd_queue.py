@@ -250,6 +250,54 @@ def _request_record(kind, request_id):
     return data if isinstance(data, dict) else None
 
 
+CANCEL_MARKER_TTL_S = 600
+
+
+def _cancel_request(kind, request_id):
+    """Stop one request on behalf of the instance that owns it.
+
+    Returns its state: "finished" (a result already exists -- nothing to
+    stop), "cancelled" (it was still queued and has been withdrawn here), or
+    "cancelling" (a worker has claimed it; the "<id>.cancel" marker tells that
+    worker to stop and publish the cancelled result itself).
+    """
+    queue_dir = XASK_QUEUE_DIR if kind == "xask" else ASK_QUEUE_DIR
+    result_dir = XASK_RESULT_DIR if kind == "xask" else ASK_RESULT_DIR
+    result_path = os.path.join(result_dir, request_id + ".json")
+    try:
+        with open(result_path, encoding="utf-8") as handle:
+            if json.load(handle).get("done"):
+                return "finished"
+    except (OSError, ValueError, AttributeError):
+        pass
+    queued = os.path.join(queue_dir, request_id + ".json")
+    withdrawn = queued + ".withdrawn"
+    try:
+        # Atomic against a worker's own claim (rename to .processing):
+        # exactly one of the two renames succeeds.
+        os.rename(queued, withdrawn)
+    except FileNotFoundError:
+        now = time.time()
+        for name in os.listdir(queue_dir):  # markers no worker ever consumed
+            if name.endswith(".cancel"):
+                stale = os.path.join(queue_dir, name)
+                try:
+                    if now - os.path.getmtime(stale) > CANCEL_MARKER_TTL_S:
+                        os.unlink(stale)
+                except FileNotFoundError:
+                    pass
+        _atomic_json(os.path.join(queue_dir, request_id + ".cancel"), {"ts": now})
+        return "cancelling"
+    try:
+        os.unlink(withdrawn)
+    except FileNotFoundError:
+        pass
+    _atomic_json(result_path, {
+        "done": True, "request_id": request_id, "cancelled": True, "answer": "", "thoughts": [],
+    })
+    return "cancelled"
+
+
 def _artifact_path(instance_id, path):
     key = hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()
     return os.path.join(RELAY_STATE_DIR, "artifacts", instance_id, key + ".json")
@@ -671,6 +719,17 @@ class Queue(BaseHTTPRequestHandler):
             queue_dir = XASK_QUEUE_DIR if self.path == "/xask" else ASK_QUEUE_DIR
             _atomic_json(os.path.join(queue_dir, f"{req_id}.json"), ask_data)
             self._json({"status": "queued"})
+
+        elif self.path in ("/cancel", "/xcancel"):
+            # .stop / .xstop: only the instance that enqueued a request may
+            # stop it.
+            if not self._body_instance_is_current(body, instance_id):
+                return
+            req_id = body.get("request_id", "")
+            kind = "xask" if self.path == "/xcancel" else "ask"
+            if not self._owns_request(kind, req_id, instance_id):
+                return
+            self._json({"status": "ok", "state": _cancel_request(kind, req_id)})
 
         elif self.path == "/tool_call":
             if not self._body_instance_is_current(body, instance_id):

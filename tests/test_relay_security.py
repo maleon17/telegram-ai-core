@@ -243,3 +243,62 @@ def test_tool_call_requires_a_same_instance_parent_ask_request(tmp_path):
         stored = json.loads((Path(relay.TOOL_QUEUE_DIR) / "tool-linked.json").read_text())
         assert stored["requester_id"] == "101"
         assert stored["owner_authorized"] is True
+
+
+def _ask(base, token, request_id, instance, endpoint="/ask"):
+    body = json.dumps({
+        "request_id": request_id, "question": "hello", "instance_id": instance, "requester_id": "101",
+    }).encode()
+    return _request(f"{base}{endpoint}", token=token, data=body)
+
+
+def _cancel(base, token, request_id, instance, endpoint="/cancel"):
+    body = json.dumps({"request_id": request_id, "instance_id": instance}).encode()
+    try:
+        status, raw = _request(f"{base}{endpoint}", token=token, data=body)
+        return status, json.loads(raw)
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read() or b"{}")
+
+
+def test_cancel_withdraws_a_queued_request_and_marks_a_claimed_one(tmp_path):
+    with relay_server(tmp_path) as (relay, base, token_a, token_b):
+        # Still queued: withdrawn on the spot, and its poller sees "cancelled".
+        _ask(base, token_a, "queued-1", "andrey")
+        assert _cancel(base, token_a, "queued-1", "andrey") == (200, {"status": "ok", "state": "cancelled"})
+        assert not (Path(relay.ASK_QUEUE_DIR) / "queued-1.json").exists()
+        result = json.loads((Path(relay.ASK_RESULT_DIR) / "queued-1.json").read_text())
+        assert result["done"] is True and result["cancelled"] is True
+        _, raw = _request(f"{base}/ask?request_id=queued-1&instance_id=andrey", token=token_a)
+        assert json.loads(raw)["cancelled"] is True
+
+        # Claimed by a worker: the relay leaves a marker for that worker.
+        _ask(base, token_a, "claimed-1", "andrey")
+        queued = Path(relay.ASK_QUEUE_DIR) / "claimed-1.json"
+        queued.rename(str(queued) + ".processing")
+        assert _cancel(base, token_a, "claimed-1", "andrey")[1]["state"] == "cancelling"
+        assert (Path(relay.ASK_QUEUE_DIR) / "claimed-1.cancel").exists()
+        assert not (Path(relay.ASK_RESULT_DIR) / "claimed-1.json").exists()
+
+        # Already answered: nothing to stop, and the answer is left alone.
+        _ask(base, token_a, "done-1", "andrey")
+        (Path(relay.ASK_RESULT_DIR) / "done-1.json").write_text(
+            json.dumps({"done": True, "request_id": "done-1", "answer": "real answer"}))
+        assert _cancel(base, token_a, "done-1", "andrey")[1]["state"] == "finished"
+        assert json.loads((Path(relay.ASK_RESULT_DIR) / "done-1.json").read_text())["answer"] == "real answer"
+
+        # The Codex queue is separate.
+        _ask(base, token_a, "x-1", "andrey", endpoint="/xask")
+        assert _cancel(base, token_a, "x-1", "andrey", endpoint="/xcancel")[1]["state"] == "cancelled"
+        assert json.loads((Path(relay.XASK_RESULT_DIR) / "x-1.json").read_text())["cancelled"] is True
+
+
+def test_only_the_owning_instance_can_cancel(tmp_path):
+    with relay_server(tmp_path) as (relay, base, token_a, token_b):
+        _ask(base, token_a, "mine-1", "andrey")
+        assert _cancel(base, token_b, "mine-1", "anatoly")[0] == 403
+        assert _cancel(base, token_b, "mine-1", "andrey")[0] == 403
+        assert _cancel(base, token_a, "no-such-request", "andrey")[0] == 404
+        assert _cancel(base, token_a, "../../etc/passwd", "andrey")[0] == 404
+        assert (Path(relay.ASK_QUEUE_DIR) / "mine-1.json").exists()
+        assert not list(Path(relay.ASK_QUEUE_DIR).glob("*.cancel"))
