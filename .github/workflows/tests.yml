@@ -1,0 +1,11 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: python -m py_compile cmd_queue.py registry.py telegram_actions_mcp.py module/jarvis_ask.py
+      - run: bash -n install_relay.sh register_instance.sh scripts/setup_userbot_network.sh
+      - run: ./scripts/run_tests.sh

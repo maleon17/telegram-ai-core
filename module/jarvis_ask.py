@@ -1,0 +1,137 @@
+# JarvisAsk — shared dispatcher for the ClaudeAsk and CodexAsk backends.
+#
+# The two backend modules deliberately remain separate: each owns its model
+# queue, progress renderer, and MCP tool poller.  This small common module is
+# the single place that knows which backend is preferred for a trigger and
+# which one is the safe fallback when the preferred account is unavailable.
+
+from herokutl.tl.custom import Message
+
+from .. import loader
+
+
+ENGINE_CLAUDE = "claude"
+ENGINE_CODEX = "codex"
+ENGINES = (ENGINE_CLAUDE, ENGINE_CODEX)
+
+# These are user-visible worker errors, not ordinary model prose.  Keep this
+# allowlist tied to prefixes emitted by the internal workers: matching a
+# keyword anywhere in an answer can mistake a legitimate explanation of rate
+# limits or quotas for a transport failure and incorrectly repeat a trigger.
+BACKEND_FAILURE_PREFIXES = (
+    "[[backend_error:",
+    "Ошибка воркера:",
+    "⚠️ Ошибка Codex:",
+    "⚠️ Ошибка очереди:",
+    "⚠️ Codex не завершил запрос за отведённое время.",
+    "⚠️ Лимит аккаунта Codex исчерпан.",
+    "⚠️ Бюджет этой сессии исчерпан.",
+    "⚠️ Контекст сессии исчерпан.",
+    "Ошибка Claude:",
+    "⚠️ Ошибка Claude:",
+    "Ошибка Claude: [",
+)
+
+ACTION_PRIORITY = {"reply": 0, "agent": 1, "post": 2, "confirm": 3, "delete": 4}
+
+
+@loader.tds
+class JarvisAsk(loader.Module):
+    """Common owner-aware coordinator for both Jarvis model backends."""
+
+    strings = {"name": "JarvisAsk"}
+
+    def _backend(self, engine):
+        """Return the loaded backend module for ``engine`` if available."""
+        name = "ClaudeAsk" if engine == ENGINE_CLAUDE else "CodexAsk"
+        try:
+            return self.lookup(name)
+        except Exception:
+            return None
+
+    def backend(self, engine):
+        engine = str(engine or ENGINE_CLAUDE).lower()
+        return self._backend(engine)
+
+    def fallback_engine(self, engine):
+        return ENGINE_CODEX if str(engine).lower() == ENGINE_CLAUDE else ENGINE_CLAUDE
+
+    def fallback(self, engine):
+        return self._backend(self.fallback_engine(engine))
+
+    @staticmethod
+    def is_failure(answer):
+        return isinstance(answer, str) and answer.strip().startswith(BACKEND_FAILURE_PREFIXES)
+
+    def engine_for_trigger(self, trigger, default=ENGINE_CLAUDE):
+        engine = str((trigger or {}).get("engine") or default).lower()
+        return engine if engine in ENGINES else default
+
+    async def client_ready(self):
+        # The backend modules own both active Telegram watchers.  Keeping
+        # this coordinator free of a third watcher is intentional: both
+        # watchers call into the same owner field and therefore cannot execute
+        # one trigger twice.
+        self._handled_messages = set()
+        return
+
+    def _get_triggers(self):
+        # ClaudeAsk historically owns this DB namespace; keeping the same
+        # namespace is what makes migration lossless for existing rules.
+        return self.db.get("ClaudeAsk", "triggers", {})
+
+    async def handle_message(self, message, owner, backend=None):
+        """Single shared trigger dispatcher called by both active watchers.
+
+        Each backend watcher passes its owner name, so both watchers may stay
+        enabled without double-firing: a rule is consumed only by the
+        watcher matching its ``engine`` field. Matching/action helpers remain
+        on the backend modules because they need that backend's Telegram
+        session, queue, and progress implementation.
+        """
+        if not isinstance(message, Message) or message.out:
+            return
+        seen = getattr(self, "_handled_messages", None)
+        if seen is None:
+            seen = self._handled_messages = set()
+        identity = (str(message.chat_id), getattr(message, "id", None))
+        if identity in seen:
+            return
+        seen.add(identity)
+        # Bound this in-memory guard; Telegram ids are unique per chat.
+        if len(seen) > 4096:
+            seen.pop()
+        owner = str(owner or ENGINE_CLAUDE).lower()
+        backend = backend or self.backend(owner)
+        if backend is None:
+            backend = self.fallback(owner)
+            if backend is None:
+                return
+            owner = self.fallback_engine(owner)
+        chat_triggers = self._get_triggers().get(str(message.chat_id))
+        if not chat_triggers:
+            return
+        resolved = []
+        for trigger in chat_triggers:
+            engine = self.engine_for_trigger(trigger)
+            target_backend = self.backend(engine)
+            if target_backend is None:
+                continue
+            if await target_backend._is_trigger_exempt(trigger, message):
+                continue
+            if not await target_backend._trigger_matches(trigger, message):
+                continue
+            if trigger.get("verify"):
+                action = await target_backend._resolve_verified_action(trigger, message)
+                if action == "none":
+                    continue
+                resolved.append((engine, {**trigger, "action": action}))
+            else:
+                resolved.append((engine, trigger))
+        if resolved:
+            priority = max(ACTION_PRIORITY.get(t.get("action"), -1) for _, t in resolved)
+            chosen = [(engine, t) for engine, t in resolved if ACTION_PRIORITY.get(t.get("action"), -1) == priority]
+            for engine in ENGINES:
+                engine_triggers = [t for e, t in chosen if e == engine]
+                if engine_triggers:
+                    await self.backend(engine)._fire_triggers(engine_triggers, message)

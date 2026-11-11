@@ -1,0 +1,31 @@
+[Unit]
+Description=Telegram AI shared queue relay
+Documentation=https://github.com/maleon17/telegram-ai-core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+UMask=0077
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+Environment=PATH=__HOME__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# relay-tokens.json (sha256(token) -> instance), relay-owners.json (instance ->
+# Telegram owner id) and the component registry live here, mode 0600, owned by
+# this user. Edits are picked up without a restart.
+Environment=TELEGRAM_AI_CONFIG_DIR=__CONFIG_DIR__
+# Queues, uploads and request manifests: private to this user, never /tmp.
+# Every worker on this host must use the same directory.
+Environment=JARVIS_STATE_DIR=__STATE_DIR__
+Environment=JARVIS_RELAY_BIND=127.0.0.1
+# Optional local overrides (for example JARVIS_RELAY_BIND, JARVIS_QUEUE_PORT).
+EnvironmentFile=-__CONFIG_DIR__/relay.env
+ExecStart=__PYTHON__ -u __INSTALL_DIR__/cmd_queue.py
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=20
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

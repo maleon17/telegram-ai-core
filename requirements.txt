@@ -1,0 +1,2 @@
+cryptography>=43
+mcp>=2.0,<3
