@@ -28,11 +28,22 @@ import registry  # noqa: E402  (sibling module of this file)
 # See that file for the full rationale/caveats; short version: this is a
 # casual "don't read as a plain chat_id->session_id map at a glance"
 # measure, not a defense against someone with root on this box.
-_JARVIS_ASK_DIR = os.environ.get("JARVIS_ASK_DIR", os.path.dirname(os.path.abspath(__file__)))
+def _claude_sessions_dir():
+    """Where the ClaudeAsk worker keeps its per-instance session maps.
+
+    It has to be the worker's own directory -- otherwise .new clears a file
+    nobody reads. $JARVIS_ASK_DIR wins; otherwise the worker's registry
+    entry ("sessions_dir", written by ClaudeAsk's setup.sh).
+    """
+    override = os.environ.get("JARVIS_ASK_DIR")
+    if override:
+        return override
+    entry = registry.component("claude-ask") or {}
+    return entry.get("sessions_dir") or os.path.join(entry.get("path") or "", "runtime")
 
 
 def _session_key_file(instance_id):
-    return os.path.join(_JARVIS_ASK_DIR, f".session_key_{instance_id}")
+    return os.path.join(_claude_sessions_dir(), f".session_key_{instance_id}")
 
 
 def _get_session_key(instance_id):
@@ -44,7 +55,7 @@ def _get_session_key(instance_id):
 def _sessions_enc_file(instance_id):
     # No special case for any instance name -- mirrors claude_watcher.py's
     # _sessions_file after the 2026-08-04 naming-symmetry fix.
-    return os.path.join(_JARVIS_ASK_DIR, f"ask_sessions_{instance_id}.enc")
+    return os.path.join(_claude_sessions_dir(), f"ask_sessions_{instance_id}.enc")
 
 
 def _state_base_dir():

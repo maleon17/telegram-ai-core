@@ -143,3 +143,38 @@ def test_relay_serves_each_products_persona_from_the_registry(config, tmp_path, 
         server.shutdown()
         thread.join(timeout=2)
         server.server_close()
+
+
+def test_reset_clears_the_session_the_claude_worker_actually_uses(config, tmp_path, capsys, monkeypatch):
+    """.new must reach the worker's own session map, wherever it keeps it."""
+    import base64
+    from cryptography.fernet import Fernet
+
+    monkeypatch.delenv("JARVIS_ASK_DIR", raising=False)
+    relay = _relay(tmp_path)
+    relay.main(["--set-owner", "mybot", "111"])
+    relay.main(["--add-token", "mybot"])
+    token = capsys.readouterr().out.strip()
+    relay._load_relay_config()
+
+    sessions_dir = tmp_path / "worker-sessions"
+    sessions_dir.mkdir()
+    key = Fernet.generate_key()
+    (sessions_dir / ".session_key_mybot").write_bytes(key)
+    raw = base64.urlsafe_b64decode(Fernet(key).encrypt(json.dumps({"42": "s1", "43": "s2"}).encode()))
+    (sessions_dir / "ask_sessions_mybot.enc").write_bytes(raw)
+    registry.register("claude-ask", path=str(tmp_path), sessions_dir=str(sessions_dir))
+
+    server = relay.ThreadingHTTPServer(("127.0.0.1", 0), relay.Queue)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _call(f"http://127.0.0.1:{server.server_port}/reset", token,
+                             {"chat_id": "42", "instance_id": "mybot"})
+        assert status == 200 and "сброшена" in body["message"]
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+    stored = Fernet(key).decrypt(base64.urlsafe_b64encode((sessions_dir / "ask_sessions_mybot.enc").read_bytes()))
+    assert json.loads(stored) == {"43": "s2"}

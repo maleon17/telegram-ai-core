@@ -1,17 +1,9 @@
 import importlib.util
 import json
-import sys
-import types
 from pathlib import Path
 
 
 def load_queue():
-    # Queue reliability paths do not use encryption; keep the test independent
-    # from the service virtualenv.
-    crypto = types.ModuleType("cryptography.fernet")
-    crypto.Fernet = object
-    sys.modules.setdefault("cryptography", types.ModuleType("cryptography"))
-    sys.modules["cryptography.fernet"] = crypto
     path = Path(__file__).parents[1] / "cmd_queue.py"
     spec = importlib.util.spec_from_file_location("queue_reliability", path)
     module = importlib.util.module_from_spec(spec)
