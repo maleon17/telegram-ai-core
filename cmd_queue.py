@@ -503,6 +503,146 @@ def _ack_tool_result(request_id, result):
             pass
 
 
+# --- delegate_to_bridge: a task for the owner's coding agent -----------------
+# Handled here rather than by the userbot: it is not a Telegram action. The
+# relay hands the task to a Telegram bridge installed on this host (found in
+# the component registry), for the bridge tenant with the same Telegram id as
+# the instance's owner, through the bridge's own cross-delegation queue. The
+# bridge applies its own checks on top (whitelist, logged-in account).
+BRIDGE_COMPONENTS = {"claude": "claude-bridge", "codex": "codex-bridge"}
+DELEGATE_ACCEPT_TIMEOUT_S = 20
+# The userbot module itself gives up on a request after ten minutes, so a
+# delegation that should report back inside the same answer must fit well
+# within that; anything longer is sent off with wait_seconds=0.
+DELEGATE_DEFAULT_WAIT_S = 240
+DELEGATE_MAX_WAIT_S = 480
+DELEGATE_POLL_S = 0.5
+
+
+def _delegation_refusal(call_data):
+    """Why this tool call may not delegate, or None if it may.
+
+    Only an interactive request from the instance's owner qualifies. The
+    owner flag was derived by this relay from the authenticated request, so a
+    trigger-fired run (its requester is the trigger, not the owner) and any
+    other sender are refused no matter what the model was told.
+    """
+    if call_data.get("direct"):
+        return "Не выполнено: из бриджа задачи другим агентам передаются его собственным инструментом."
+    if not call_data.get("owner_authorized"):
+        return (
+            "Не выполнено: передавать задачи кодовому агенту может только владелец "
+            "этого юзербота в собственном запросе; из триггеров и для других людей это недоступно."
+        )
+    return None
+
+
+def _delegate_to_bridge(owner_id, args):
+    """Run one delegation to completion; returns the tool result text."""
+    agent = str(args.get("agent") or "claude").strip().lower()
+    component = BRIDGE_COMPONENTS.get(agent)
+    if component is None:
+        return "Не выполнено: agent должен быть «claude» или «codex»."
+    prompt = args.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return "Не выполнено: текст задачи пуст."
+    try:
+        chat_id = int(owner_id)
+    except (TypeError, ValueError):
+        return "Не выполнено: у этого instance нет владельца."
+    entry = registry.component(component)
+    if not entry:
+        return f"Не выполнено: {agent}-бридж на этом сервере не установлен."
+    queue_dir = os.path.join(entry["path"], "cross_delegate_queue")
+    result_dir = os.path.join(entry["path"], "cross_delegate_result")
+    if not os.path.isdir(queue_dir) or not os.path.isdir(result_dir):
+        # Never create directories inside another product's checkout.
+        return f"Не выполнено: {agent}-бридж установлен, но ещё ни разу не запускался."
+    request_id = str(uuid.uuid4())
+    request_path = os.path.join(queue_dir, request_id + ".json")
+    result_path = os.path.join(result_dir, request_id + ".json")
+    try:
+        _atomic_json(request_path, {"chat_id": chat_id, "text": prompt})
+    except OSError as exc:
+        return f"Не выполнено: не удалось передать задачу бриджу: {exc}"
+
+    accepted = None
+    deadline = time.monotonic() + DELEGATE_ACCEPT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            with open(result_path, encoding="utf-8") as handle:
+                accepted = json.load(handle)
+        except (OSError, ValueError):
+            time.sleep(0.2)
+            continue
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
+        break
+    if not isinstance(accepted, dict):
+        try:
+            os.unlink(request_path)
+        except FileNotFoundError:
+            return (
+                f"{agent}-бридж забрал задачу, но не подтвердил её за "
+                f"{DELEGATE_ACCEPT_TIMEOUT_S} с. Она могла начаться; не отправляй её повторно."
+            )
+        return (
+            f"Не выполнено: {agent}-бридж не ответил за {DELEGATE_ACCEPT_TIMEOUT_S} с — "
+            "похоже, его сервис не запущен. Задача НЕ начата."
+        )
+    text = accepted.get("text") if isinstance(accepted.get("text"), str) else ""
+    if not accepted.get("ok"):
+        return f"Не выполнено: {agent}-бридж отклонил задачу: {text or 'без объяснения'}"
+
+    try:
+        wait = float(args.get("wait_seconds", DELEGATE_DEFAULT_WAIT_S))
+    except (TypeError, ValueError):
+        wait = DELEGATE_DEFAULT_WAIT_S
+    wait = max(0.0, min(wait, DELEGATE_MAX_WAIT_S))
+    final = accepted.get("final")
+    still_running = (
+        f"Задача принята ({text}). Она ещё выполняется; итоговый ответ придёт "
+        f"владельцу в чат {agent}-бота, сюда он уже не вернётся."
+    )
+    if wait <= 0 or not isinstance(final, dict) or not isinstance(final.get("path"), str):
+        return still_running if wait > 0 else f"Задача принята: {text}"
+    after_ts = float(final.get("after_ts") or 0)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        try:
+            with open(final["path"], encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and float(data.get("ts") or 0) >= after_ts:
+            if final.get("consume"):
+                try:
+                    os.unlink(final["path"])
+                except OSError:
+                    pass
+            answer = data.get("text") if isinstance(data.get("text"), str) and data["text"].strip() else "(пустой ответ)"
+            if data.get("ok") is False:
+                return f"{agent}-агент завершил задачу с ошибкой:\n{answer}"
+            return f"Ответ {agent}-агента (он же отправлен владельцу в чат бота):\n{answer}"
+        time.sleep(DELEGATE_POLL_S)
+    return still_running
+
+
+def _start_delegation(request_id, owner_id, args):
+    """Run a delegation in the background and publish its outcome as the
+    tool call's result (the MCP client polls for it like any other)."""
+    def run():
+        try:
+            result = _delegate_to_bridge(owner_id, args)
+        except Exception as exc:  # the caller must always get an answer
+            result = f"Не выполнено: ошибка при передаче задачи: {exc}"
+        _ack_tool_result(request_id, result)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 # Distinct from a genuine "unsure" verdict: "unsure" means the model looked
 # at the condition and text and couldn't confidently say yes/no -- a real
 # answer that still escalates to a human via the confirm flow. This sentinel
@@ -820,6 +960,18 @@ class Queue(BaseHTTPRequestHandler):
                 self._json({"status": "accepted", "request_id": req_id})
                 return
             _record_request("tool", req_id, instance_id, parent.get("requester_id"))
+            if call_data["tool"] == "delegate_to_bridge":
+                # Served by the relay itself; it never reaches the userbot.
+                refusal = _delegation_refusal(call_data)
+                if refusal:
+                    _ack_tool_result(req_id, refusal)
+                else:
+                    _start_delegation(
+                        req_id, RELAY_OWNER_IDS.get(instance_id, ""),
+                        call_data["args"] if isinstance(call_data["args"], dict) else {},
+                    )
+                self._json({"status": "queued"})
+                return
             _atomic_json(os.path.join(TOOL_QUEUE_DIR, f"{req_id}.json"), call_data)
             self._json({"status": "queued"})
 

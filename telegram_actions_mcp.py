@@ -135,9 +135,9 @@ def _relay_headers(content_type=None):
     return headers
 
 
-def _call_tool(tool: str, args: dict) -> str:
+def _call_tool(tool: str, args: dict, timeout_s: "float | None" = None) -> str:
     req_id = str(uuid.uuid4())
-    deadline = time.time() + POLL_TIMEOUT_S
+    deadline = time.time() + (POLL_TIMEOUT_S if timeout_s is None else timeout_s)
     body = json.dumps({
         "request_id": req_id, "instance_id": INSTANCE_ID, "chat_id": _current_chat_id(),
         "requester_id": _current_requester_id(), "parent_request_id": _current_request_id(),
@@ -561,6 +561,38 @@ def forward_message(chat: str, message_id: int, to: str = "") -> str:
     чат (обычный случай: нашёл нужное в чужом чате через read_history/
     search_chat с chat=..., теперь принеси это сюда)."""
     return _call_tool("forward_message", {"chat": chat, "message_id": message_id, "to": to})
+
+
+
+if not DIRECT:
+    # Not offered inside a bridge: its agent has the bridge's own delegation
+    # tool, and a bridge handing work to a bridge through here would loop.
+    @mcp.tool()
+    def delegate_to_bridge(prompt: str, agent: str = "claude", wait_seconds: int = 240) -> str:
+        """Передать задачу кодовому агенту владельца -- Claude Code или Codex,
+        который работает в его Telegram-бридже на этом же сервере (его
+        проекты и рабочая папка, постоянная сессия, нет десятиминутного
+        предела .ask). agent: "claude" или "codex".
+
+        Агент получает ТОЛЬКО текст prompt -- пиши задачу полностью, со всем
+        нужным контекстом, он не видит этот чат.
+
+        Инструмент ждёт до wait_seconds секунд (не больше 480) и возвращает
+        итоговый ответ агента; тот же ответ агент сам отправит владельцу в
+        чат бота. Для долгой работы ставь wait_seconds=0: задача уйдёт,
+        ответ придёт владельцу в чат бота, а ты сразу скажи, что передал.
+
+        Работает только в собственном запросе владельца юзербота. Из
+        триггеров и по просьбе других людей вернёт отказ -- это намеренно,
+        не ищи обход (в том числе через shell)."""
+        try:
+            wait = max(0, min(int(wait_seconds), 480))
+        except (TypeError, ValueError):
+            wait = 240
+        return _call_tool(
+            "delegate_to_bridge", {"prompt": prompt, "agent": agent, "wait_seconds": wait},
+            timeout_s=wait + 60,
+        )
 
 
 if __name__ == "__main__":
