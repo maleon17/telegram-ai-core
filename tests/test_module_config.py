@@ -43,6 +43,8 @@ def ask(request, monkeypatch):
     for name in ("_ENV_BACKEND_URL", "_ENV_HTTP_PROXY", "_ENV_INSTANCE_ID", "_ENV_RELAY_TOKEN"):
         monkeypatch.setattr(module, name, "")
     monkeypatch.setattr(module, "_load_mistral_api_key", lambda: "")
+    # Never install or start a real Tailscale from a test.
+    monkeypatch.setattr(module, "_ensure_tailnet", lambda hostname: ("running", "100.64.0.2"))
     monkeypatch.setattr(module.utils, "get_args_raw", lambda message: message.args, raising=False)
     bot = getattr(module, class_name)()
     bot.db = claude_harness.FakeDB()

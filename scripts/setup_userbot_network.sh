@@ -132,8 +132,9 @@ setup_remote_tailnet() {
     else
         echo "Saved $queue_unit override; it will apply when the relay service is installed and started."
     fi
-    echo "The remote userbot needs Tailscale in its own container and must join this same tailnet."
-    echo "Then run .asknet/.xasknet tailnet <instance_id> http://$tailnet_ip:9092 on the userbot."
+    echo "On the remote userbot run .asknet/.xasknet tailnet <instance_id> http://$tailnet_ip:9092."
+    echo "The module installs Tailscale in its container and replies with a login link: approve it"
+    echo "with the same Tailscale account as this server, then run .asknet/.xasknet check."
 }
 
 if [[ ! -t 0 ]]; then
