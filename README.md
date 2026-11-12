@@ -25,15 +25,10 @@ This repository holds what both userbot products share, so that either one can b
 | Installers | `install_relay.sh`, `register_instance.sh` | Idempotent, non-interactive; used by the product setup scripts |
 | Userbot host | `deploy/userbot/`, `scripts/setup_userbot_network.sh` | Local Docker userbot, or Tailscale for a remote one |
 
-```mermaid
-flowchart LR
-    U["Userbot module<br/>(claude_ask / codex_ask)"] -->|"/ask, /xask, /cancel"| R["cmd_queue.py<br/>relay"]
-    R --> CW["ClaudeAsk worker"]
-    R --> XW["CodexAsk worker"]
-    CW --> M["telegram_actions_mcp.py"]
-    XW --> M
-    M -->|"tool call"| R -->|"/tool_call_pending"| U
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img alt="Your userbot's modules talk to the cmd_queue.py relay, which authenticates every instance and decides ownership; the ClaudeAsk and CodexAsk workers answer through it; their agents use telegram_actions_mcp.py, whose tool calls go back through the relay to the userbot; the bridges use it with an owner-only bridge token and receive delegate_to_bridge tasks; registry.json records which parts live where." src="docs/architecture-light.svg" width="860">
+</picture>
 
 The backend never owns the Telegram account. A Telegram action is queued back to the module that holds the live session, and the agent sees the real result before it can claim the action happened.
 
