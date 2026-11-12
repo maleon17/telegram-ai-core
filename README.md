@@ -1,10 +1,18 @@
+<div align="center">
+
 # Telegram AI Core
 
-> Part of **[Telegram AI](https://github.com/maleon17/telegram-ai)** — Claude/Codex from dedicated bots or directly inside your Telegram account.
+**The shared engine behind ClaudeAsk and CodexAsk.**
 
-The shared foundation of **[ClaudeAsk](https://github.com/maleon17/claude-ask)** and **[CodexAsk](https://github.com/maleon17/codex-ask)**. You normally do not install it by hand: each product's `setup.sh` finds this repository next to its own checkout, or clones it there, and runs what it needs.
+Part of **[Telegram AI](https://github.com/maleon17/telegram-ai)** — Claude Code and Codex from Telegram, on your own subscription.
 
-It exists so that either product can be installed on its own. Before, each of the two needed a file that lived only in the other.
+</div>
+
+---
+
+> **You probably don't need to install this yourself.** The setup scripts of **[ClaudeAsk](https://github.com/maleon17/claude-ask)** and **[CodexAsk](https://github.com/maleon17/codex-ask)** fetch it next to their own folder and run what they need. Read on if you want to know how the pieces fit, manage relay credentials by hand, or work on the userbot module.
+
+This repository holds what both userbot products share, so that either one can be installed on its own: the queue relay between the userbot and the backend, the Telegram-action tools the agents use, and the single source both userbot modules are built from.
 
 ## What is here
 
@@ -72,6 +80,10 @@ No `sudo` is involved in managing them, and the running relay notices an edit by
 ```
 
 Each worker keeps its own token in `relay-token-claude.env` / `relay-token-codex.env` there, so installing one product never overwrites the other's credentials.
+
+A Telegram bridge on the same host can get a narrower **bridge token** (`--add-bridge-token <instance>`, done automatically by the bridges): it lets the instance's owner use that instance's Telegram actions from their bridge chat — always as the owner, whatever the caller claims — and can do nothing else. `--owned-by <telegram_id>` lists the instances a person owns.
+
+The relay also serves `delegate_to_bridge` itself: a userbot request may hand a task to the owner's coding agent in a Telegram bridge and get the answer back. It is allowed only in the instance owner's own request — never from a trigger, another person or a bridge token.
 
 The authenticated userbot reports who sent a request. The relay cannot prove the original Telegram sender itself, so the userbot is an explicit trust boundary; owner authorisation is nevertheless derived server-side from the token's instance, and a client cannot simply claim to be the owner. Requests, tool calls, results, personas, resets, cancellations and downloadable artifacts are all scoped by instance.
 
