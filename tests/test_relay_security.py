@@ -28,12 +28,12 @@ def _load_relay():
 @contextmanager
 def relay_server(tmp_path):
     relay = _load_relay()
-    token_a, token_b = "token-for-andrey", "token-for-anatoly"
+    token_a, token_b = "token-for-alice", "token-for-bob"
     relay.RELAY_TOKENS = {
-        hashlib.sha256(token_a.encode()).hexdigest(): "andrey",
-        hashlib.sha256(token_b.encode()).hexdigest(): "anatoly",
+        hashlib.sha256(token_a.encode()).hexdigest(): "alice-bot",
+        hashlib.sha256(token_b.encode()).hexdigest(): "bob-bot",
     }
-    relay.RELAY_OWNER_IDS = {"andrey": "101", "anatoly": "202"}
+    relay.RELAY_OWNER_IDS = {"alice-bot": "101", "bob-bot": "202"}
     relay.ASK_QUEUE_DIR = str(tmp_path / "ask")
     relay.ASK_RESULT_DIR = str(tmp_path / "result")
     relay.XASK_QUEUE_DIR = str(tmp_path / "xask")
@@ -83,24 +83,24 @@ def test_relay_requires_bearer_and_scopes_instance_resources(tmp_path):
     with relay_server(tmp_path) as (relay, base, token_a, token_b):
         body = json.dumps({
             "request_id": "request-a", "question": "hello",
-            "instance_id": "andrey", "requester_id": "101",
+            "instance_id": "alice-bot", "requester_id": "101",
         }).encode()
         assert _status(f"{base}/ask", data=body) == 401
         assert _status(f"{base}/ask", token=token_a, data=json.dumps({
             "request_id": "wrong-instance", "question": "hello",
-            "instance_id": "anatoly",
+            "instance_id": "bob-bot",
         }).encode()) == 403
         assert _status(f"{base}/ask", token=token_a, data=body) == 200
         queued = json.loads((Path(relay.ASK_QUEUE_DIR) / "request-a.json").read_text())
-        assert queued["instance_id"] == "andrey"
+        assert queued["instance_id"] == "alice-bot"
         assert queued["owner_authorized"] is True
         assert _status(f"{base}/ask", token=token_b, data=json.dumps({
-            "request_id": "request-a", "question": "collision", "instance_id": "anatoly",
+            "request_id": "request-a", "question": "collision", "instance_id": "bob-bot",
         }).encode()) == 403
 
         non_owner = json.dumps({
             "request_id": "request-non-owner", "question": "hello",
-            "instance_id": "andrey", "requester_id": "202", "owner_authorized": True,
+            "instance_id": "alice-bot", "requester_id": "202", "owner_authorized": True,
         }).encode()
         assert _status(f"{base}/ask", token=token_a, data=non_owner) == 200
         queued = json.loads((Path(relay.ASK_QUEUE_DIR) / "request-non-owner.json").read_text())
@@ -110,13 +110,13 @@ def test_relay_requires_bearer_and_scopes_instance_resources(tmp_path):
         result.write_text(json.dumps({"done": True, "answer": "private"}))
         assert _status(f"{base}/ask?request_id=request-a", token=token_b) == 403
 
-        artifact = Path(relay.ARTIFACT_DIR) / "andrey" / "report.bin"
+        artifact = Path(relay.ARTIFACT_DIR) / "alice-bot" / "report.bin"
         artifact.parent.mkdir(parents=True)
         artifact.write_bytes(b"private artifact")
         assert _status(
             f"{base}/download?path={urllib.parse.quote(str(artifact))}", token=token_a,
         ) == 404
-        relay._register_artifact("andrey", str(artifact))
+        relay._register_artifact("alice-bot", str(artifact))
         assert _status(
             f"{base}/download?path={urllib.parse.quote(str(artifact))}", token=token_b,
         ) == 403
@@ -128,7 +128,7 @@ def test_relay_sanitizes_trigger_context_and_session_chat_id(tmp_path):
         tail = "fresh context tail"
         context = "old context " * 25000 + tail
         valid = json.dumps({
-            "request_id": "trigger-valid", "question": "reply", "instance_id": "andrey",
+            "request_id": "trigger-valid", "question": "reply", "instance_id": "alice-bot",
             "chat_context": context, "session_chat_id": "-1009876543210",
         }).encode()
         assert _status(f"{base}/ask", token=token_a, data=valid) == 200
@@ -139,7 +139,7 @@ def test_relay_sanitizes_trigger_context_and_session_chat_id(tmp_path):
         assert len(queued["chat_context"]) == 200000
 
         invalid = json.dumps({
-            "request_id": "trigger-invalid", "question": "reply", "instance_id": "andrey",
+            "request_id": "trigger-invalid", "question": "reply", "instance_id": "alice-bot",
             "chat_context": ["not a string"], "session_chat_id": "owner-chat",
         }).encode()
         assert _status(f"{base}/ask", token=token_a, data=invalid) == 200
@@ -153,7 +153,7 @@ def test_relay_configuration_rejects_missing_or_empty_token_file(monkeypatch, tm
     relay = _load_relay()
     monkeypatch.delenv("JARVIS_RELAY_TOKENS_FILE", raising=False)
     monkeypatch.setenv("JARVIS_RELAY_OWNERS_FILE", str(tmp_path / "owners.json"))
-    (tmp_path / "owners.json").write_text('{"andrey": "101"}')
+    (tmp_path / "owners.json").write_text('{"alice-bot": "101"}')
     with pytest.raises(RuntimeError, match="JARVIS_RELAY_TOKENS_FILE"):
         relay._load_relay_config()
 
@@ -186,7 +186,7 @@ def test_persona_post_sends_exactly_one_response_on_instance_mismatch(tmp_path, 
     monkeypatch.setenv("JARVIS_PERSONA_DIR", str(tmp_path / "personas"))
     with relay_server(tmp_path) as (relay, base, token_a, _):
         body = json.dumps({
-            "instance_id": "not-andrey", "persona": "hi",
+            "instance_id": "not-alice", "persona": "hi",
         }).encode()
         try:
             _request(f"{base}/persona", token=token_a, data=body)
@@ -199,7 +199,7 @@ def test_persona_post_sends_exactly_one_response_on_instance_mismatch(tmp_path, 
         # The connection must be left in a clean state for the next request
         # -- a stray second write would show up as extra unread bytes.
         status2, raw2 = _request(
-            f"{base}/persona?instance_id=andrey", token=token_a, data=None,
+            f"{base}/persona?instance_id=alice-bot", token=token_a, data=None,
         )
         assert status2 == 200
         assert json.loads(raw2)["status"] == "ok"
@@ -212,21 +212,21 @@ def test_tool_call_requires_a_same_instance_parent_ask_request(tmp_path):
     with relay_server(tmp_path) as (relay, base, token_a, token_b):
         # No parent at all.
         orphan = json.dumps({
-            "request_id": "tool-orphan", "instance_id": "andrey",
+            "request_id": "tool-orphan", "instance_id": "alice-bot",
             "parent_request_id": "no-such-request", "chat_id": "1",
             "tool": "send_message", "args": {},
         }).encode()
         assert _status(f"{base}/tool_call", token=token_a, data=orphan) == 403
 
-        # Enqueue a real /ask as andrey, then try to anchor a tool call to it
-        # while authenticated as anatoly.
+        # Enqueue a real /ask as alice-bot, then try to anchor a tool call to it
+        # while authenticated as bob-bot.
         ask_body = json.dumps({
             "request_id": "ask-parent", "question": "hi",
-            "instance_id": "andrey", "requester_id": "101",
+            "instance_id": "alice-bot", "requester_id": "101",
         }).encode()
         assert _status(f"{base}/ask", token=token_a, data=ask_body) == 200
         cross_instance = json.dumps({
-            "request_id": "tool-cross", "instance_id": "anatoly",
+            "request_id": "tool-cross", "instance_id": "bob-bot",
             "parent_request_id": "ask-parent", "chat_id": "1",
             "tool": "send_message", "args": {},
         }).encode()
@@ -235,7 +235,7 @@ def test_tool_call_requires_a_same_instance_parent_ask_request(tmp_path):
         # Same instance, correct parent: accepted, and requester_id/
         # owner_authorized come from the parent record, not the tool call body.
         linked = json.dumps({
-            "request_id": "tool-linked", "instance_id": "andrey",
+            "request_id": "tool-linked", "instance_id": "alice-bot",
             "parent_request_id": "ask-parent", "chat_id": "1",
             "tool": "send_message", "args": {}, "requester_id": "999",
         }).encode()
@@ -264,41 +264,41 @@ def _cancel(base, token, request_id, instance, endpoint="/cancel"):
 def test_cancel_withdraws_a_queued_request_and_marks_a_claimed_one(tmp_path):
     with relay_server(tmp_path) as (relay, base, token_a, token_b):
         # Still queued: withdrawn on the spot, and its poller sees "cancelled".
-        _ask(base, token_a, "queued-1", "andrey")
-        assert _cancel(base, token_a, "queued-1", "andrey") == (200, {"status": "ok", "state": "cancelled"})
+        _ask(base, token_a, "queued-1", "alice-bot")
+        assert _cancel(base, token_a, "queued-1", "alice-bot") == (200, {"status": "ok", "state": "cancelled"})
         assert not (Path(relay.ASK_QUEUE_DIR) / "queued-1.json").exists()
         result = json.loads((Path(relay.ASK_RESULT_DIR) / "queued-1.json").read_text())
         assert result["done"] is True and result["cancelled"] is True
-        _, raw = _request(f"{base}/ask?request_id=queued-1&instance_id=andrey", token=token_a)
+        _, raw = _request(f"{base}/ask?request_id=queued-1&instance_id=alice-bot", token=token_a)
         assert json.loads(raw)["cancelled"] is True
 
         # Claimed by a worker: the relay leaves a marker for that worker.
-        _ask(base, token_a, "claimed-1", "andrey")
+        _ask(base, token_a, "claimed-1", "alice-bot")
         queued = Path(relay.ASK_QUEUE_DIR) / "claimed-1.json"
         queued.rename(str(queued) + ".processing")
-        assert _cancel(base, token_a, "claimed-1", "andrey")[1]["state"] == "cancelling"
+        assert _cancel(base, token_a, "claimed-1", "alice-bot")[1]["state"] == "cancelling"
         assert (Path(relay.ASK_QUEUE_DIR) / "claimed-1.cancel").exists()
         assert not (Path(relay.ASK_RESULT_DIR) / "claimed-1.json").exists()
 
         # Already answered: nothing to stop, and the answer is left alone.
-        _ask(base, token_a, "done-1", "andrey")
+        _ask(base, token_a, "done-1", "alice-bot")
         (Path(relay.ASK_RESULT_DIR) / "done-1.json").write_text(
             json.dumps({"done": True, "request_id": "done-1", "answer": "real answer"}))
-        assert _cancel(base, token_a, "done-1", "andrey")[1]["state"] == "finished"
+        assert _cancel(base, token_a, "done-1", "alice-bot")[1]["state"] == "finished"
         assert json.loads((Path(relay.ASK_RESULT_DIR) / "done-1.json").read_text())["answer"] == "real answer"
 
         # The Codex queue is separate.
-        _ask(base, token_a, "x-1", "andrey", endpoint="/xask")
-        assert _cancel(base, token_a, "x-1", "andrey", endpoint="/xcancel")[1]["state"] == "cancelled"
+        _ask(base, token_a, "x-1", "alice-bot", endpoint="/xask")
+        assert _cancel(base, token_a, "x-1", "alice-bot", endpoint="/xcancel")[1]["state"] == "cancelled"
         assert json.loads((Path(relay.XASK_RESULT_DIR) / "x-1.json").read_text())["cancelled"] is True
 
 
 def test_only_the_owning_instance_can_cancel(tmp_path):
     with relay_server(tmp_path) as (relay, base, token_a, token_b):
-        _ask(base, token_a, "mine-1", "andrey")
-        assert _cancel(base, token_b, "mine-1", "anatoly")[0] == 403
-        assert _cancel(base, token_b, "mine-1", "andrey")[0] == 403
-        assert _cancel(base, token_a, "no-such-request", "andrey")[0] == 404
-        assert _cancel(base, token_a, "../../etc/passwd", "andrey")[0] == 404
+        _ask(base, token_a, "mine-1", "alice-bot")
+        assert _cancel(base, token_b, "mine-1", "bob-bot")[0] == 403
+        assert _cancel(base, token_b, "mine-1", "alice-bot")[0] == 403
+        assert _cancel(base, token_a, "no-such-request", "alice-bot")[0] == 404
+        assert _cancel(base, token_a, "../../etc/passwd", "alice-bot")[0] == 404
         assert (Path(relay.ASK_QUEUE_DIR) / "mine-1.json").exists()
         assert not list(Path(relay.ASK_QUEUE_DIR).glob("*.cancel"))

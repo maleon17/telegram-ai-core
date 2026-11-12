@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 
-OWNER_ID = "8480261623"
+OWNER_ID = "1000000001"
 CURRENT_CHAT_ID = "-1001234567890"
 OTHER_CHAT_ID = "-1009876543210"
 

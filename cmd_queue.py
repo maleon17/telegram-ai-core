@@ -42,7 +42,7 @@ def _get_session_key(instance_id):
 
 
 def _sessions_enc_file(instance_id):
-    # No special case for "andrey" -- mirrors claude_watcher.py's
+    # No special case for any instance name -- mirrors claude_watcher.py's
     # _sessions_file after the 2026-08-04 naming-symmetry fix.
     return os.path.join(_JARVIS_ASK_DIR, f"ask_sessions_{instance_id}.enc")
 
@@ -736,7 +736,7 @@ def classify_semantic_codex(text: str, condition: str, instance_id: str, timeout
     classify prompt, no persona, no session resume. Kept as a fully
     separate function rather than parameterizing classify_semantic --
     matches this file's existing convention of duplicating client-specific
-    logic rather than sharing it (see claude_ask.py vs claude_ask_anatoly.py)."""
+    logic rather than sharing it."""
     if not condition or not text:
         return "unsure"
     req_id = str(uuid.uuid4())
