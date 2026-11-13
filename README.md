@@ -120,6 +120,8 @@ Module commands (CodexAsk uses the `x` prefix: `.xask`, `.xstop`, …):
 
 Settings are stored in the module config, so `.cfg ClaudeAsk` / `.cfg CodexAsk` edits the same values that `.asknet` sets.
 
+The interface language is the `language` setting (`auto` follows the userbot's `.setlang`). Its strings are in `module/locales/<lang>.json`, which `module/build.py` embeds into both modules; English is the reference, and a string missing from another language falls back to it. Changing the language also moves the persona (`/persona_language` on the relay): an unedited one is replaced by the product's `personas/default.<lang>.md.example`, an edited one is translated by the product's worker without keeping a session, and the owner's original is kept next to it, so switching back restores it as written.
+
 ## Tests
 
 ```bash

@@ -127,6 +127,29 @@ def _current_exclude_msg_id():
     return _current_int("message_id", EXCLUDE_MSG_ID)
 
 
+# The three answers this server writes itself, in the language of the turn
+# (the watcher passes it like the chat id). The timeout one is quoted by the
+# shipped personas: keep it equal to cmd_queue.py's PERSONA_TIMEOUT_MARKER.
+_TEXTS = {
+    "en": ("Could not queue the action: {error}", "(empty result)",
+           "Timeout: result unknown (the task may already have been handed to the executor)."),
+    "ru": ("Не удалось поставить действие в очередь: {error}", "(пустой результат)",
+           "Таймаут: результат неизвестен (задание могло уже быть выдано исполнителю)."),
+    "uk": ("Не вдалося поставити дію в чергу: {error}", "(порожній результат)",
+           "Тайм-аут: результат невідомий (завдання вже могло бути передане виконавцю)."),
+    "kk": ("Әрекетті кезекке қою мүмкін болмады: {error}", "(бос нәтиже)",
+           "Күту уақыты бітті: нәтиже белгісіз (тапсырма орындаушыға берілген болуы мүмкін)."),
+    "de": ("Die Aktion konnte nicht in die Warteschlange gestellt werden: {error}", "(leeres Ergebnis)",
+           "Zeitüberschreitung: Ergebnis unbekannt (die Aufgabe wurde möglicherweise schon an den Ausführenden übergeben)."),
+}
+
+
+def _texts():
+    context = _current_context()
+    language = (context or {}).get("language") or os.environ.get("JARVIS_LANGUAGE", "")
+    return _TEXTS.get(language, _TEXTS["en"])
+
+
 def _relay_headers(content_type=None):
     token = RELAY_TOKENS.get(INSTANCE_ID, RELAY_TOKEN) if isinstance(RELAY_TOKENS, dict) else RELAY_TOKEN
     headers = {"Authorization": f"Bearer {token}"}
@@ -158,7 +181,7 @@ def _call_tool(tool: str, args: dict, timeout_s: "float | None" = None) -> str:
             timeout=5,
         )
     except Exception as e:
-        return f"Не удалось поставить действие в очередь: {e}"
+        return _texts()[0].replace("{error}", str(e))
 
     while time.time() < deadline:
         time.sleep(POLL_INTERVAL_S)
@@ -169,10 +192,10 @@ def _call_tool(tool: str, args: dict, timeout_s: "float | None" = None) -> str:
         except Exception:
             continue
         if data.get("done"):
-            return data.get("result") or "(пустой результат)"
+            return data.get("result") or _texts()[1]
     # The relay refuses an expired item on its next claim. A prior claim may
     # already be executing, so it must not be acknowledged/cancelled here.
-    return "Таймаут: результат неизвестен (задание могло уже быть выдано исполнителю)."
+    return _texts()[2]
 
 
 @mcp.tool()

@@ -39,6 +39,7 @@ def _install_import_stubs():
         String=lambda *args, **kwargs: None,
         Hidden=lambda *args, **kwargs: None,
         Integer=lambda *args, **kwargs: None,
+        Choice=lambda *args, **kwargs: None,
     )
     loader.tds = lambda value: value
     loader.watcher = lambda *args, **kwargs: (lambda value: value)
@@ -105,6 +106,9 @@ def _load_claude_ask():
 
 
 claude_ask = _load_claude_ask()
+# These tests check the Russian interface texts; English is covered by
+# test_module_language.py.
+claude_ask.LANG = "ru"
 # The module ships unconfigured (no built-in backend address or instance);
 # tests stand in for what .asknet would have stored.
 claude_ask.BACKEND_URL = "http://relay.test:9092"

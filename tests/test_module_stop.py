@@ -89,7 +89,7 @@ def test_unconfirmed_backend_stop_is_reported_honestly(ask):
     assert "r" in bot._cancelled_requests
     assert bot._finish_request("r").get("cancel_error") is True
     assert "r" not in bot._cancelled_requests and "r" not in bot._active_requests
-    assert module.STOPPED_UNCONFIRMED_TEXT != module.STOPPED_TEXT
+    assert module._t("stopped_unconfirmed") != module._t("stopped")
 
 
 def test_a_cancelled_result_from_the_backend_is_not_an_answer(ask):

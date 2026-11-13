@@ -9,6 +9,7 @@ they are now generated from ask_module.py.tmpl:
     @@TOKEN@@                      replaced per flavor (see FLAVORS)
     #@if claude | #@if codex       keep the following lines for that flavor only
     #@else / #@endif
+    @@LOCALES@@                    the interface strings, from locales/<lang>.json
 
     build.py            write dist/claude_ask.py and dist/codex_ask.py
     build.py --check    exit 1 if dist/ is not what the template produces
@@ -18,6 +19,7 @@ they are now generated from ask_module.py.tmpl:
 Never edit the generated files: change the template and rebuild.
 """
 import hashlib
+import json
 import os
 import re
 import sys
@@ -25,6 +27,10 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "ask_module.py.tmpl")
 DIST = os.path.join(HERE, "dist")
+LOCALES_DIR = os.path.join(HERE, "locales")
+# English is the reference: every other language may only use its keys, and
+# a key it lacks falls back to English at run time.
+REFERENCE_LANGUAGE = "en"
 
 FLAVORS = {
     "claude": {
@@ -60,9 +66,34 @@ class TemplateError(Exception):
     pass
 
 
-def render(template, flavor):
+def load_locales():
+    """{language: {key: text}} from locales/*.json, checked against English:
+    no unknown keys, and the same {placeholders} in every translation."""
+    locales = {}
+    for name in sorted(os.listdir(LOCALES_DIR)):
+        if name.endswith(".json"):
+            with open(os.path.join(LOCALES_DIR, name), encoding="utf-8") as handle:
+                locales[name[:-5]] = json.load(handle)
+    reference = locales.get(REFERENCE_LANGUAGE)
+    if not reference:
+        raise TemplateError(f"locales/{REFERENCE_LANGUAGE}.json is missing")
+    placeholder = re.compile(r"\{(\w+)\}")
+    for language, strings in locales.items():
+        for key, text in strings.items():
+            if key not in reference:
+                raise TemplateError(f"locales/{language}.json: unknown key {key!r}")
+            if not isinstance(text, str):
+                raise TemplateError(f"locales/{language}.json: {key!r} is not a string")
+            if set(placeholder.findall(text)) != set(placeholder.findall(reference[key])):
+                raise TemplateError(f"locales/{language}.json: {key!r} has different placeholders")
+    return locales
+
+
+def render(template, flavor, locales=None):
     """One flavor's module source. Raises TemplateError on a malformed template."""
     values = FLAVORS[flavor]
+    if locales is None:
+        locales = load_locales()
     output = []
     branch = None  # None outside a block, else True/False = "these lines are kept"
     for number, line in enumerate(template.splitlines(), 1):
@@ -85,19 +116,28 @@ def render(template, flavor):
         if branch is False:
             continue
 
-        def substitute(match):
+        def substitute(match, number=number):
             name = match.group(1)
             if name not in values or not isinstance(values[name], str):
                 raise TemplateError(f"line {number}: unknown token @@{name}@@")
             return values[name]
 
+        if "@@LOCALES@@" in line:
+            # Locale texts may use the flavor tokens too (@@X@@ask, ...).
+            filled = {
+                language: {key: _TOKEN_RE.sub(substitute, text) for key, text in strings.items()}
+                for language, strings in locales.items()
+            }
+            line = line.replace("@@LOCALES@@", json.dumps(filled, ensure_ascii=False, indent=4, sort_keys=True))
         output.append(_TOKEN_RE.sub(substitute, line))
     if branch is not None:
         raise TemplateError("unterminated #@if at end of template")
-    digest = hashlib.sha256(template.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(
+        (template + json.dumps(locales, sort_keys=True)).encode("utf-8")
+    ).hexdigest()[:12]
     banner = (
         f"# GENERATED FILE -- do not edit. Built from telegram-ai-core "
-        f"module/ask_module.py.tmpl (sha256 {digest});\n"
+        f"module/ask_module.py.tmpl and module/locales (sha256 {digest});\n"
         f"# change the template there and run module/build.py.\n"
     )
     source = banner + "\n".join(output) + "\n"
@@ -108,7 +148,8 @@ def render(template, flavor):
 def build():
     with open(TEMPLATE, encoding="utf-8") as handle:
         template = handle.read()
-    return {values["OUTPUT"]: render(template, flavor) for flavor, values in FLAVORS.items()}
+    locales = load_locales()
+    return {values["OUTPUT"]: render(template, flavor, locales) for flavor, values in FLAVORS.items()}
 
 
 def _write(path, text):

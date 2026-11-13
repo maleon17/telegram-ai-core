@@ -436,14 +436,24 @@ def _persona_open_regular(path):
         return fh.read(_PERSONA_READ_CAP + 1)
 
 
-def _persona_read(persona_dir, instance_id, owner=("владелец", "")):
+def _persona_templates(persona_dir, language=None):
+    """The shipped persona templates to try for a language, best first:
+    default.<lang>.md.example, then default.md.example (English)."""
+    names = []
+    if language in PERSONA_LANGUAGES and language != "en":
+        names.append(f"default.{language}.md.example")
+    names.append("default.md.example")
+    return [os.path.join(persona_dir, name) for name in names]
+
+
+def _persona_read(persona_dir, instance_id, owner=("владелец", ""), language=None):
     """Return (text, source): source is 'instance', 'default', 'template' or
     'missing' -- the same lookup order and {{OWNER_*}} filling the watchers use,
     so a GET shows exactly what the model receives."""
     for path, source in (
         (_persona_path(persona_dir, instance_id), "instance"),
         (os.path.join(persona_dir, "default.md"), "default"),
-        (os.path.join(persona_dir, "default.md.example"), "template"),
+        *((template, "template") for template in _persona_templates(persona_dir, language)),
     ):
         try:
             text = _persona_open_regular(path)
@@ -457,6 +467,273 @@ def _persona_read(persona_dir, instance_id, owner=("владелец", "")):
             continue  # empty -> fall through, matching the watchers' load_persona
         return text, source
     return "", "missing"
+
+
+# --- Persona language --------------------------------------------------------
+# The userbot module's `language` setting also moves the persona. An instance
+# without its own persona file simply gets the shipped template of its
+# language (the module names it on every request). An instance file that is
+# just a shipped template is removed, so the right template takes over; an
+# edited one is translated by the backend's model. The text the owner last
+# wrote is kept next to it (.lang/<instance>.source.md, with its language in
+# .lang/<instance>.json), and translations always start from it: switching
+# back to its language restores it byte for byte, and switching on never
+# translates a translation.
+PERSONA_LANGUAGES = {
+    "en": "English", "ru": "Russian", "uk": "Ukrainian", "kk": "Kazakh", "de": "German",
+}
+PERSONA_TRANSLATE_TIMEOUT_S = 600
+_PERSONA_JOBS = {}  # job id -> {"instance_id", "language", "response" (None while running)}
+_PERSONA_JOBS_LOCK = threading.Lock()
+# What the MCP tools themselves answer on a timeout -- quoted by the shipped
+# personas, so a translation must keep it in step (see telegram_actions_mcp.py).
+PERSONA_TIMEOUT_MARKER = {
+    "en": "Timeout: result unknown", "ru": "Таймаут: результат неизвестен",
+    "uk": "Тайм-аут: результат невідомий", "kk": "Күту уақыты бітті: нәтиже белгісіз",
+    "de": "Zeitüberschreitung: Ergebnis unbekannt",
+}
+
+
+def _persona_meta_paths(persona_dir, instance_id):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", instance_id or "default")
+    folder = os.path.join(persona_dir, ".lang")
+    return folder, os.path.join(folder, safe + ".json"), os.path.join(folder, safe + ".source.md")
+
+
+def _persona_meta(persona_dir, instance_id):
+    _, meta_path, _ = _persona_meta_paths(persona_dir, instance_id)
+    try:
+        with open(meta_path, encoding="utf-8") as handle:
+            meta = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _persona_write_private(path, text):
+    """Write a 0600 file atomically."""
+    tmp = f"{path}.tmp{uuid.uuid4().hex}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _persona_remember(persona_dir, instance_id, language, source_text=None):
+    """Record the instance file's language. With source_text (the owner just
+    wrote it), that text becomes the original translations start from."""
+    folder, meta_path, source_path = _persona_meta_paths(persona_dir, instance_id)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    meta = _persona_meta(persona_dir, instance_id)
+    meta["language"] = language
+    if source_text is not None:
+        meta["source_language"] = language
+        _persona_write_private(source_path, source_text)
+    _persona_write_private(meta_path, json.dumps(meta))
+
+
+def _persona_forget(persona_dir, instance_id):
+    """Drop the language record and the kept original."""
+    _, meta_path, source_path = _persona_meta_paths(persona_dir, instance_id)
+    for path in (meta_path, source_path):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+def _persona_normalized(text):
+    return "\n".join(line.rstrip() for line in (text or "").strip().splitlines())
+
+
+def _persona_is_shipped(persona_dir, text, owner):
+    """True when an instance file is word for word one of the shipped
+    templates (raw, or with the owner filled in as the editor shows it)."""
+    wanted = _persona_normalized(text)
+    try:
+        names = os.listdir(persona_dir)
+    except OSError:
+        return False
+    for name in names:
+        if not (name.startswith("default") and name.endswith(".md.example")):
+            continue
+        try:
+            template = _persona_open_regular(os.path.join(persona_dir, name))
+        except (OSError, UnicodeError):
+            continue
+        filled = template.replace("{{OWNER_NAME}}", owner[0]).replace("{{OWNER_TG_ID}}", owner[1])
+        if wanted in (_persona_normalized(template), _persona_normalized(filled)):
+            return True
+    return False
+
+
+def _persona_translation_prompt(text, source, target, markers):
+    """The instruction for the model that translates a custom persona."""
+    pairs = []
+    source_markers = (markers or {}).get(source) or []
+    target_markers = (markers or {}).get(target) or []
+    for before, after in zip(source_markers, target_markers):
+        if isinstance(before, str) and isinstance(after, str) and before and after and before != after:
+            pairs.append(f"«{before}» -> «{after}»")
+    if PERSONA_TIMEOUT_MARKER[source] != PERSONA_TIMEOUT_MARKER[target]:
+        pairs.append(f"«{PERSONA_TIMEOUT_MARKER[source]}» -> «{PERSONA_TIMEOUT_MARKER[target]}»")
+    marker_note = (
+        "The program inserts some literal strings into the assistant's context, and "
+        "the persona may quote them. Wherever the persona quotes one of these, use "
+        "exactly its counterpart:\n" + "\n".join(pairs) + "\n\n"
+    ) if pairs else ""
+    return (
+        f"Translate the persona below (the system prompt of an AI assistant) from "
+        f"{PERSONA_LANGUAGES[source]} into {PERSONA_LANGUAGES[target]}. Translate all "
+        "of it, faithfully, keeping its structure, tone, emphasis and meaning; do not "
+        "summarize, shorten, soften or add anything. Keep unchanged: the placeholders "
+        "{{OWNER_NAME}} and {{OWNER_TG_ID}}, tool and parameter names, code, HTML tags "
+        "and command syntax.\n\n" + marker_note +
+        "Output only the translated persona text and nothing else: no commentary, "
+        "no headings of your own, no code fences.\n\n"
+        "The persona follows.\n\n" + text
+    )
+
+
+def _persona_translation_problem(original, translated):
+    """Why a model's translation must not replace the persona, or None."""
+    translated = (translated or "").strip()
+    if len(translated) < max(12, len(original.strip()) // 3):
+        return "too short"
+    if translated.startswith("```") or translated.endswith("```"):
+        return "wrapped in a code fence"
+    if re.match(r"(?i)^(?:sorry|i cannot|i can't|unable to|извини|не могу)\b", translated):
+        return "a refusal"
+    if any(line.startswith("#") for line in original.splitlines()) and not any(
+        line.startswith("#") for line in translated.splitlines()
+    ):
+        return "headings were lost"
+    for placeholder in ("{{OWNER_NAME}}", "{{OWNER_TG_ID}}"):
+        if placeholder in original and placeholder not in translated:
+            return f"{placeholder} was lost"
+    if _persona_has_control_chars(translated):
+        return "control characters"
+    return None
+
+
+def _run_persona_translation(job_id, queue_dir, result_dir, persona_dir, instance_id,
+                             source_text, source, target, markers):
+    """Background thread: one translation through the product's worker."""
+    req_id = str(uuid.uuid4())
+    response = {"status": "error", "code": "persona_translate_bad"}
+    try:
+        _atomic_json(os.path.join(queue_dir, f"{req_id}.json"), {
+            "question": _persona_translation_prompt(source_text, source, target, markers),
+            "chat_id": "persona", "instance_id": instance_id, "request_id": req_id,
+            "mode": "persona_translate", "language": target, "ts": time.time(), "done": False,
+        })
+        result_path = os.path.join(result_dir, f"{req_id}.json")
+        deadline = time.time() + PERSONA_TRANSLATE_TIMEOUT_S
+        data = None
+        while time.time() < deadline:
+            if os.path.exists(result_path):
+                try:
+                    with open(result_path, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                except (OSError, ValueError):
+                    data = None
+                if data and data.get("done"):
+                    break
+            time.sleep(1)
+        try:
+            os.remove(result_path)
+        except FileNotFoundError:
+            pass
+        if not data or not data.get("done"):
+            response = {"status": "error", "code": "persona_lang_timeout"}
+        else:
+            answer = str(data.get("answer") or "")
+            if answer.startswith("[[backend_error:") or data.get("cancelled"):
+                response = {"status": "error", "code": "persona_translate_backend",
+                            "values": {"error": answer[:300] or "cancelled"}}
+            elif _persona_translation_problem(source_text, answer) is None:
+                payload = answer.strip() + "\n"
+                if len(payload.encode("utf-8")) <= _PERSONA_MAX_BYTES:
+                    _persona_write_private(_persona_path(persona_dir, instance_id), payload)
+                    _persona_remember(persona_dir, instance_id, target)
+                    response = {"status": "ok", "action": "translated"}
+    except Exception as exc:
+        response = {"status": "error", "code": "persona_translate_backend", "values": {"error": str(exc)[:300]}}
+    with _PERSONA_JOBS_LOCK:
+        _PERSONA_JOBS[job_id]["response"] = response
+
+
+def _persona_set_language(path, instance_id, language, markers):
+    """POST /persona_language: the response the module acts on."""
+    if language not in PERSONA_LANGUAGES:
+        return {"status": "error", "code": "bad_language", "message": "Неизвестный язык"}
+    persona_dir = _persona_dir_for(path)
+    if persona_dir is None:
+        return {"status": "error", "code": "product_missing", "message": "Этот продукт не установлен на сервере"}
+    with _PERSONA_JOBS_LOCK:
+        for job_id, job in _PERSONA_JOBS.items():
+            if job["instance_id"] == f"{path}:{instance_id}" and job["response"] is None:
+                if job["language"] == language:
+                    return {"status": "translating", "job": job_id}
+    target = _persona_path(persona_dir, instance_id)
+    try:
+        text = _persona_open_regular(target)
+    except FileNotFoundError:
+        # No own persona: the template of the request's language is used.
+        _persona_forget(persona_dir, instance_id)
+        return {"status": "ok", "action": "template"}
+    if _persona_is_shipped(persona_dir, text, _persona_owner_for(path)):
+        os.remove(target)
+        _persona_forget(persona_dir, instance_id)
+        return {"status": "ok", "action": "swapped"}
+    meta = _persona_meta(persona_dir, instance_id)
+    current = meta.get("language")
+    if current not in PERSONA_LANGUAGES:
+        # A persona from before languages existed: it is taken to be in the
+        # language the module has been using, never translated blindly.
+        _persona_remember(persona_dir, instance_id, language, source_text=text)
+        return {"status": "ok", "action": "adopted"}
+    if current == language:
+        return {"status": "ok", "action": "unchanged"}
+    _, _, source_path = _persona_meta_paths(persona_dir, instance_id)
+    source = meta.get("source_language") if meta.get("source_language") in PERSONA_LANGUAGES else current
+    try:
+        source_text = _persona_open_regular(source_path)
+    except OSError:
+        source_text, source = text, current
+    if source == language:
+        _persona_write_private(target, source_text)
+        _persona_remember(persona_dir, instance_id, language)
+        return {"status": "ok", "action": "restored"}
+    codex = path.startswith("/xpersona")
+    job_id = uuid.uuid4().hex
+    with _PERSONA_JOBS_LOCK:
+        _PERSONA_JOBS[job_id] = {"instance_id": f"{path}:{instance_id}", "language": language, "response": None}
+    threading.Thread(
+        target=_run_persona_translation, daemon=True,
+        args=(job_id, XASK_QUEUE_DIR if codex else ASK_QUEUE_DIR, XASK_RESULT_DIR if codex else ASK_RESULT_DIR,
+              persona_dir, instance_id, source_text, source, language, markers),
+    ).start()
+    return {"status": "translating", "job": job_id}
+
+
+def _persona_language_job(path, instance_id, job_id):
+    """GET /persona_language?job=: the job's response while it is known."""
+    with _PERSONA_JOBS_LOCK:
+        job = _PERSONA_JOBS.get(job_id)
+        if job is None or job["instance_id"] != f"{path}:{instance_id}":
+            # A relay restart forgets its jobs; the module retries later.
+            return {"status": "error", "code": "job_lost"}
+        if job["response"] is None:
+            return {"status": "translating", "job": job_id}
+        return _PERSONA_JOBS.pop(job_id)["response"]
 
 
 def _pop_pending_tool_call(instance_id: str, now=None):
@@ -897,6 +1174,8 @@ class Queue(BaseHTTPRequestHandler):
             session_chat_id = body.get("session_chat_id")
             if isinstance(session_chat_id, str) and re.fullmatch(r"-?\d+", session_chat_id):
                 ask_data["session_chat_id"] = session_chat_id
+            if body.get("language") in PERSONA_LANGUAGES:
+                ask_data["language"] = body["language"]
             ask_data["instance_id"] = instance_id
             if existing:
                 self._json({"status": "accepted", "request_id": req_id})
@@ -1017,7 +1296,7 @@ class Queue(BaseHTTPRequestHandler):
                 return
             reset_id = f"reset_{uuid.uuid4().hex}"
             _atomic_json(os.path.join(XASK_RESET_DIR, reset_id + ".json"), {"chat_id": str(chat_id), "instance_id": instance_id})
-            self._json({"status": "ok", "message": f"Codex-сессия чата {chat_id} будет сброшена"})
+            self._json({"status": "ok", "message": f"Codex-сессия чата {chat_id} будет сброшена", "code": "relay_xsession_reset", "values": {"chat": str(chat_id)}})
 
         elif self.path in ("/persona", "/xpersona"):
             # Write (or reset) an instance's editable persona file. The watcher
@@ -1027,6 +1306,8 @@ class Queue(BaseHTTPRequestHandler):
             # command.
             if not self._body_instance_is_current(body, instance_id):
                 return
+            # Replies carry a `code` the module shows in its own language;
+            # `message` stays for older modules.
             persona_dir = _persona_dir_for(self.path)
             if persona_dir is None:
                 self._error(404, "Этот продукт не установлен на сервере")
@@ -1034,41 +1315,49 @@ class Queue(BaseHTTPRequestHandler):
             os.makedirs(persona_dir, exist_ok=True)
             target = _persona_path(persona_dir, instance_id)
             if body.get("reset"):
+                _persona_forget(persona_dir, instance_id)
                 try:
                     os.remove(target)
-                    self._json({"status": "ok", "message": "Персона сброшена к шаблону"})
+                    self._json({"status": "ok", "code": "persona_reset", "message": "Персона сброшена к шаблону"})
                 except FileNotFoundError:
-                    self._json({"status": "ok", "message": "Персона уже дефолтная"})
+                    self._json({"status": "ok", "code": "persona_already_default", "message": "Персона уже дефолтная"})
                 return
             text = body.get("persona")
             if not isinstance(text, str) or not text.strip():
-                self._json({"status": "error", "message": "Пустая персона"})
+                self._json({"status": "error", "code": "persona_empty", "message": "Пустая персона"})
                 return
             if _persona_has_control_chars(text):
-                self._json({"status": "error", "message": "Недопустимые управляющие символы в персоне"})
+                self._json({"status": "error", "code": "persona_control_chars", "message": "Недопустимые управляющие символы в персоне"})
                 return
             payload = text.strip() + "\n"
             try:
                 payload_bytes = len(payload.encode("utf-8"))
             except UnicodeEncodeError:
-                self._json({"status": "error", "message": "Персона содержит недопустимые символы Unicode"})
+                self._json({"status": "error", "code": "persona_bad_unicode", "message": "Персона содержит недопустимые символы Unicode"})
                 return
             if payload_bytes > _PERSONA_MAX_BYTES:
-                self._json({"status": "error", "message": "Персона слишком большая"})
+                self._json({"status": "error", "code": "persona_too_big_relay", "message": "Персона слишком большая"})
                 return
-            tmp = f"{target}.tmp{uuid.uuid4().hex}"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(payload)
-                os.replace(tmp, target)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-            self._json({"status": "ok", "message": "Персона обновлена, применится со следующего запроса"})
+            _persona_write_private(target, payload)
+            # What the owner writes is the original later translations start
+            # from, in the language the module is using now. A module too old
+            # to say leaves the language unknown: the next language sync
+            # adopts the text as it is.
+            language = body.get("language")
+            if language in PERSONA_LANGUAGES:
+                _persona_remember(persona_dir, instance_id, language, source_text=payload)
+            else:
+                _persona_forget(persona_dir, instance_id)
+            self._json({"status": "ok", "code": "persona_updated_relay", "message": "Персона обновлена, применится со следующего запроса"})
+
+        elif self.path in ("/persona_language", "/xpersona_language"):
+            # The module's language changed: bring the persona along.
+            if not self._body_instance_is_current(body, instance_id):
+                return
+            markers = body.get("markers") if isinstance(body.get("markers"), dict) else {}
+            self._json(_persona_set_language(
+                self.path, instance_id, str(body.get("language") or ""), markers,
+            ))
 
         elif self.path == "/reset":
             chat_id = body.get("chat_id", "")
@@ -1106,7 +1395,11 @@ class Queue(BaseHTTPRequestHandler):
                         os.chmod(sessions_file, 0o600)
                         cleared = True
                 msg = f"Сессия чата {chat_id} сброшена" if cleared else "Сессия уже пуста"
-                self._json({"status": "ok", "message": msg})
+                self._json({
+                    "status": "ok", "message": msg,
+                    "code": "relay_session_reset" if cleared else "relay_session_empty",
+                    "values": {"chat": str(chat_id)},
+                })
             else:
                 self._json({"status": "error", "message": "Нет chat_id"})
 
@@ -1183,6 +1476,13 @@ class Queue(BaseHTTPRequestHandler):
                 "role": "bridge" if self.bridge_token else "userbot",
             })
 
+        elif self.path.startswith(("/persona_language", "/xpersona_language")):
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            if not self._query_instance_is_current(params, instance_id):
+                return
+            self._json(_persona_language_job(parsed.path, instance_id, params.get("job", [""])[0]))
+
         elif self.path.startswith("/persona") or self.path.startswith("/xpersona"):
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
@@ -1192,7 +1492,9 @@ class Queue(BaseHTTPRequestHandler):
             if persona_dir is None:
                 self._error(404, "Этот продукт не установлен на сервере")
                 return
-            text, source = _persona_read(persona_dir, instance_id, _persona_owner_for(self.path))
+            text, source = _persona_read(
+                persona_dir, instance_id, _persona_owner_for(self.path), params.get("language", [""])[0],
+            )
             self._json({"status": "ok", "persona": text, "source": source})
 
         elif self.path.startswith("/ask") or self.path.startswith("/xask"):
