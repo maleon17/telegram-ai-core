@@ -41,7 +41,7 @@ from herokutl.errors import FloodWaitError, UserPrivacyRestrictedError, UserNotP
 from .. import loader, utils
 from .._internal import fw_protect
 
-__version__ = (2, 2, 1)
+__version__ = (2, 2, 2)
 
 # Interface language. Every user-visible string (and the text this module
 # hands to the model) lives in telegram-ai-core module/locales/<lang>.json;
@@ -995,6 +995,10 @@ class @@MODULE@@(loader.Module):
             if tool in HISTORY_TOOLS:
                 return self._chat_arg_is_current(args.get("chat"), chat_id)
             if tool in TRIGGER_LOCAL_SEND_TOOLS:
+                return self._trigger_send_target_is_authorized(
+                    trig, args.get("target"), chat_id, topic_id,
+                )
+            if tool == "send_file" and str(args.get("target") or "").strip():
                 return self._trigger_send_target_is_authorized(
                     trig, args.get("target"), chat_id, topic_id,
                 )
@@ -3468,10 +3472,16 @@ class @@MODULE@@(loader.Module):
         # _describe_attachment's docstring for why this is needed at all).
         attachment_note = await self._describe_attachment(message)
         attachment_part = f"\n{attachment_note}" if attachment_note else ""
-        question = (
-            _t("reply_agent_prompt", label=trig.get("label", trig["kind"]), chat=chat_label, sender=sender,
-               text=(message.raw_text or ""), attachment=attachment_part)
-        )
+        instruction = str(trig.get("instruction") or "").strip()
+        if instruction:
+            question = _t("reply_agent_instructed_prompt", label=trig.get("label", trig["kind"]), chat=chat_label,
+                          sender=sender, text=(message.raw_text or ""), attachment=attachment_part,
+                          instruction=instruction)
+        else:
+            question = (
+                _t("reply_agent_prompt", label=trig.get("label", trig["kind"]), chat=chat_label, sender=sender,
+                   text=(message.raw_text or ""), attachment=attachment_part)
+            )
         origin_chat = str(trig.get("registration_chat_id") or "").strip()
         # Explicit session override, same rule as _fire_agent_action: "here"
         # pins to the firing chat's own session regardless of where the
@@ -3512,7 +3522,9 @@ class @@MODULE@@(loader.Module):
             self._commit_trigger_context_anchor(context_anchor)
             self._active_requests[req_id] = {"chat_id": str(message.chat_id), "work_message_id": None}
             try:
-                answer, _thoughts = await self._poll_result_silent(req_id, timeout_s=60)
+                answer, _thoughts = await self._poll_result_silent(
+                    req_id, timeout_s=POLL_TIMEOUT_S if instruction or trig.get("allowed_tools") else 60,
+                )
             finally:
                 self._finish_request(req_id)
         if answer is CANCELLED:

@@ -381,6 +381,32 @@ def test_reply_trigger_does_not_duplicate_successful_send_message(monkeypatch):
     message.reply.assert_not_awaited()
 
 
+def test_reply_trigger_with_an_instruction_posts_the_answer_as_a_reply(monkeypatch):
+    bot = make_module()
+    trig = trigger(action="reply", instruction="answer politely", allowed_tools=["read_history"])
+    message = FakeMessage()
+    bot._enqueue_async = AsyncMock(return_value=(True, None))
+    bot._backend_failed = Mock(return_value=False)
+    bot._poll_result_silent = AsyncMock(return_value=("the answer", []))
+
+    run_async(bot._fire_reply_via_agent(trig, message, "watched chat", "sender", allow_fallback=False))
+
+    question = bot._enqueue_async.call_args.args[0]
+    assert "answer politely" in question
+    assert bot._poll_result_silent.call_args.kwargs["timeout_s"] == claude_ask.POLL_TIMEOUT_S
+    message.reply.assert_awaited_once_with("the answer")
+
+
+def test_trigger_send_file_stays_inside_the_current_chat():
+    trig = trigger(allowed_tools=["send_file"])
+    bot = make_module({CURRENT_CHAT_ID: [trig]})
+    ask = lambda target: run_async(bot._tool_request_is_authorized(
+        "trigger:trigger-1", CURRENT_CHAT_ID, tool="send_file", args={"path": "/x", "target": target},
+    ))
+    assert ask("") and ask(CURRENT_CHAT_ID)
+    assert not ask(OTHER_CHAT_ID)
+
+
 def test_edited_trigger_reloads_final_message_before_matching(monkeypatch):
     bot = make_module()
     peer = object()
