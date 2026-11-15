@@ -95,6 +95,7 @@
  "hist_sticker": "🎭 Стікер: {path}",
  "hist_sticker_bare": "🎭 Стікер",
  "hist_unparsed": "[не вдалося розібрати повідомлення]",
+ "hist_cut": " […обрізано: усього {total} симв.; повний текст віддає read_history]",
  "hist_video": "🎥 Відео",
  "hist_video_note": "🎥 Відеокружок, розшифровка: {transcript}",
  "hist_voice": "🎤 Голосове, розшифровка: {transcript}",

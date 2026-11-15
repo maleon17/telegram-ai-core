@@ -95,6 +95,7 @@
  "hist_sticker": "🎭 Sticker: {path}",
  "hist_sticker_bare": "🎭 Sticker",
  "hist_unparsed": "[could not parse the message]",
+ "hist_cut": " […cut: {total} chars in total; read_history returns the full text]",
  "hist_video": "🎥 Video",
  "hist_video_note": "🎥 Video message, transcript: {transcript}",
  "hist_voice": "🎤 Voice message, transcript: {transcript}",

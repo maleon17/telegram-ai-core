@@ -95,6 +95,7 @@
  "hist_sticker": "🎭 Sticker: {path}",
  "hist_sticker_bare": "🎭 Sticker",
  "hist_unparsed": "[Nachricht konnte nicht ausgewertet werden]",
+ "hist_cut": " […gekürzt: insgesamt {total} Zeichen; read_history liefert den vollen Text]",
  "hist_video": "🎥 Video",
  "hist_video_note": "🎥 Videonachricht, Transkript: {transcript}",
  "hist_voice": "🎤 Sprachnachricht, Transkript: {transcript}",

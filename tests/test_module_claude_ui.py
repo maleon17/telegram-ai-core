@@ -177,6 +177,15 @@ def test_format_messages_marks_which_message_a_reply_answers():
     assert "id=12" in lines[2] and "реплай на id=10" in lines[2]
 
 
+def test_a_long_history_line_is_cut_late_and_says_so():
+    bot = make_module()
+    long_text = "x" * 1500
+    lines = run(bot._format_messages([HistoryMsg(10, "y" * 900), HistoryMsg(11, long_text)])).splitlines()
+    assert lines[0].endswith("y" * 900)
+    assert "x" * 1000 in lines[1] and "x" * 1001 not in lines[1]
+    assert "1500" in lines[1] and "read_history" in lines[1]
+
+
 class HistoryClient:
     """Small in-memory stand-in for get_messages' two cursor modes."""
 

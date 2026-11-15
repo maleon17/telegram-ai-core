@@ -95,6 +95,7 @@
  "hist_sticker": "🎭 Стикер: {path}",
  "hist_sticker_bare": "🎭 Стикер",
  "hist_unparsed": "[хабарламаны талдау мүмкін болмады]",
+ "hist_cut": " […қысқартылды: барлығы {total} таңба; толық мәтінді read_history береді]",
  "hist_video": "🎥 Видео",
  "hist_video_note": "🎥 Видеохабарлама, мәтіні: {transcript}",
  "hist_voice": "🎤 Дауыстық, мәтіні: {transcript}",
