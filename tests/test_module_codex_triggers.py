@@ -409,6 +409,15 @@ def test_trigger_send_file_stays_inside_the_current_chat():
     assert not ask(OTHER_CHAT_ID)
 
 
+def test_an_agent_trigger_can_be_edited_into_a_reply_trigger():
+    trig = trigger(action="agent", report_to="notify", session="here")
+    bot = make_module({CURRENT_CHAT_ID: [trig]})
+    merged, error = bot._build_trigger({**trig, "action": "reply", "report_to": None})
+    assert error is None and merged["action"] == "reply" and "report_to" not in merged
+    _, error = bot._build_trigger({**trig, "action": "delete", "report_to": "notify"})
+    assert error is not None
+
+
 def test_edited_trigger_reloads_final_message_before_matching(monkeypatch):
     bot = make_module()
     peer = object()
