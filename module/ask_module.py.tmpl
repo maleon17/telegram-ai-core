@@ -41,7 +41,7 @@ from herokutl.errors import FloodWaitError, UserPrivacyRestrictedError, UserNotP
 from .. import loader, utils
 from .._internal import fw_protect
 
-__version__ = (2, 2, 3)
+__version__ = (2, 3, 0)
 
 # Interface language. Every user-visible string (and the text this module
 # hands to the model) lives in telegram-ai-core module/locales/<lang>.json;
@@ -356,6 +356,7 @@ PUBLIC_TOOLS = frozenset({
     "resolve_person", "list_chat_members", "list_triggers",
     "search_chat", "read_history",
 })
+CREATE_FILE_MAX_BYTES = 2 * 1024 * 1024
 TRIGGER_REQUESTER_PREFIX = "trigger:"
 TRIGGER_DEFAULT_ALLOWED_TOOLS = frozenset({"send_message"})
 HISTORY_TOOLS = frozenset({"search_chat", "read_history"})
@@ -2094,6 +2095,24 @@ class @@MODULE@@(loader.Module):
     # MCP tools alongside SEARCH_CHAT/READ_HISTORY/LIST_TRIGGERS/CREATE_GROUP/
     # INVITE_TO_GROUP/RESOLVE_PERSON above, same 2026-08-11 pass. Nothing in
     # this file parses `[MARKER:...]` syntax out of a model answer anymore.
+
+    async def _create_file_action(self, filename, content):
+        """Real create_file MCP tool handler: stores a text file on the relay
+        host through /upload (which also registers it for send_file) and
+        returns its path."""
+        name = os.path.basename(str(filename or "").replace("\\", "/"))
+        name = re.sub(r'[\x00-\x1f"]', "_", name).strip().lstrip(".")[:120]
+        if not name:
+            return _t("create_file_bad_name")
+        if not isinstance(content, str):
+            return _t("create_file_bad_content")
+        data = content.encode("utf-8")
+        if len(data) > CREATE_FILE_MAX_BYTES:
+            return _t("create_file_too_big", limit=CREATE_FILE_MAX_BYTES // 1024)
+        path = await self._upload_to_lightrag(data, name)
+        if not path:
+            return _t("create_file_failed", name=name)
+        return _t("create_file_ok", name=name, path=path)
 
     async def _send_file_action(self, path, target, chat_id):
         """Real send_file MCP tool handler (was the SEND_FILE text marker,
@@ -4356,6 +4375,8 @@ class @@MODULE@@(loader.Module):
             elif tool == "send_message_as_bot":
                 result = await self._send_message_action(args.get("target", ""), args.get("text", ""), as_bot=True)
                 self._mark_sent_message(chat_id, result)
+            elif tool == "create_file":
+                result = await self._create_file_action(args.get("filename", ""), args.get("content", ""))
             elif tool == "send_file":
                 result = await self._send_file_action(args.get("path", ""), args.get("target", ""), chat_id)
             elif tool in ("add_contact", "remove_contact", "block_user", "unblock_user"):

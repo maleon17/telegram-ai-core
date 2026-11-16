@@ -825,6 +825,29 @@ def _delegation_refusal(call_data):
     return None
 
 
+def _trigger_send_file_refusal(instance_id, call_data):
+    """Why a trigger-fired run may not send this file, or None if it may.
+
+    A trigger acts on behalf of whoever wrote in a chat, so it may only send
+    files that live in the instance's own uploads folder: what create_file
+    made and what people attached in the chat. Any other path on this host
+    stays out of reach, whatever the model was talked into.
+    """
+    if call_data.get("tool") != "send_file":
+        return None
+    if not str(call_data.get("requester_id") or "").startswith("trigger:"):
+        return None
+    args = call_data.get("args") if isinstance(call_data.get("args"), dict) else {}
+    path = os.path.realpath(str(args.get("path") or ""))
+    uploads = os.path.realpath(os.path.join(ARTIFACT_DIR, instance_id, "uploads"))
+    if path.startswith(uploads + os.sep) and os.path.isfile(path):
+        return None
+    return (
+        "Не выполнено: из триггера можно отправлять только файлы, созданные инструментом "
+        "create_file или присланные в чат."
+    )
+
+
 def _delegate_to_bridge(owner_id, args):
     """Run one delegation to completion; returns the tool result text."""
     agent = str(args.get("agent") or "claude").strip().lower()
@@ -1250,6 +1273,11 @@ class Queue(BaseHTTPRequestHandler):
                 self._json({"status": "accepted", "request_id": req_id})
                 return
             _record_request("tool", req_id, instance_id, parent.get("requester_id"))
+            refusal = _trigger_send_file_refusal(instance_id, call_data)
+            if refusal:
+                _ack_tool_result(req_id, refusal)
+                self._json({"status": "queued"})
+                return
             if call_data["tool"] == "delegate_to_bridge":
                 # Served by the relay itself; it never reaches the userbot.
                 refusal = _delegation_refusal(call_data)

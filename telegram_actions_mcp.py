@@ -290,6 +290,16 @@ def send_file(path: str, target: str = "") -> str:
 
 
 @mcp.tool()
+def create_file(filename: str, content: str) -> str:
+    """Создать текстовый файл с заданным содержимым и получить его путь,
+    чтобы отправить через send_file. filename -- только имя файла с
+    расширением (например report.md), без папок. content -- весь текст
+    файла. Бинарные файлы так не создать. Это единственный способ получить
+    файл для send_file из триггера: любые другие пути он не примет."""
+    return _call_tool("create_file", {"filename": filename, "content": content})
+
+
+@mcp.tool()
 def add_contact(target: str) -> str:
     """Добавить человека (id или @username, среди существующих диалогов) в
     контакты."""

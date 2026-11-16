@@ -165,3 +165,25 @@ def test_relay_codes_are_shown_in_the_interface_language(ask, monkeypatch):
     assert bot._relay_message(reply, "new_session") == "The session of chat 5 was reset"
     assert bot._relay_message({"message": "старое"}, "new_session") == "старое"
     assert bot._relay_message({}, "new_session") == "New session"
+
+
+def test_create_file_uploads_the_text_and_returns_its_path(ask):
+    bot = ask.bot
+    bot._upload_to_lightrag = AsyncMock(return_value="/relay/uploads/abc_report.md")
+    result = run(bot._create_file_action('../evil/"report".md', "# hi"))
+    data, name = bot._upload_to_lightrag.await_args.args
+    assert data == b"# hi"
+    assert "/" not in name and '"' not in name and not name.startswith(".")
+    assert "/relay/uploads/abc_report.md" in result
+
+
+def test_create_file_refuses_bad_names_and_huge_content(ask):
+    bot = ask.bot
+    bot._upload_to_lightrag = AsyncMock(return_value="/p")
+    for bad_name in ("", "...", "dir/"):
+        assert "❌" in run(bot._create_file_action(bad_name, "x"))
+    assert "❌" in run(bot._create_file_action("a.txt", "x" * (ask.module.CREATE_FILE_MAX_BYTES + 1)))
+    assert "❌" in run(bot._create_file_action("a.txt", 5))
+    bot._upload_to_lightrag.assert_not_awaited()
+    bot._upload_to_lightrag = AsyncMock(return_value=None)
+    assert "❌" in run(bot._create_file_action("a.txt", "x"))
