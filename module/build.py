@@ -43,7 +43,7 @@ FLAVORS = {
         "WATCHER": "claude_watcher.py",
         "VIA": "",
         "PRODUCT": "claude-ask",
-        "CHECKOUTS": ("claude-ask", "claude-jarvis"),
+        "CHECKOUTS": (".claude-ask", "claude-ask", ".claude-jarvis", "claude-jarvis"),
     },
     "codex": {
         "OUTPUT": "codex_ask.py",
@@ -55,7 +55,7 @@ FLAVORS = {
         "WATCHER": "codex_ask_watcher.py",
         "VIA": " (Codex)",
         "PRODUCT": "codex-ask",
-        "CHECKOUTS": ("codex-ask", "codex-jarvis"),
+        "CHECKOUTS": (".codex-ask", "codex-ask", ".codex-jarvis", "codex-jarvis"),
     },
 }
 _TOKEN_RE = re.compile(r"@@([A-Z_]+)@@")

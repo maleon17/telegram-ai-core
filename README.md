@@ -87,8 +87,8 @@ Runtime state (queues, uploads, request manifests) lives in `~/.local/state/tele
 ## Installing the relay by hand
 
 ```bash
-git clone https://github.com/maleon17/telegram-ai-core.git
-cd telegram-ai-core
+git clone https://github.com/maleon17/telegram-ai-core.git ~/.telegram-ai-core
+cd ~/.telegram-ai-core
 ./install_relay.sh                       # virtualenv, systemd unit, registry entries
 ./register_instance.sh mybot 123456789   # first instance; this also starts the relay
 ```
