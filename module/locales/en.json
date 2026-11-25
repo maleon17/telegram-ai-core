@@ -29,6 +29,8 @@
  "btn_save": "✅ Save",
  "cancelled": "Cancelled",
  "cfg_backend_url": "Address of the backend's queue relay, for example http://127.0.0.1:9092. Easier to set with .@@X@@asknet",
+"cfg_gemini_api_key": "Google AI Studio (Gemini) key for voice transcription. Primary engine; Mistral is the fallback. Empty means only Mistral is used",
+"cfg_gemini_model": "Gemini model for voice transcription (default: gemini-2.5-flash-lite)",
  "cfg_http_proxy": "HTTP proxy to the relay. Empty means a direct connection; for a tailnet without /dev/net/tun use http://localhost:1056",
  "cfg_instance_id": "This userbot's identifier on the backend (printed by setup.sh)",
  "cfg_language": "Language of the module and of the Jarvis persona: auto (same as the userbot), en, ru, uk, kk or de. On a change the default persona is replaced by the repository's translation; an edited one is translated by the model",

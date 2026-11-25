@@ -16,7 +16,7 @@ FLAVORS = {
 }
 SETTINGS = (
     "BACKEND_URL", "HTTP_PROXY", "INSTANCE_ID", "RELAY_TOKEN", "RELAY_OPENER",
-    "TEST_CHANNEL_BOT_ID", "MISTRAL_API_KEY",
+    "TEST_CHANNEL_BOT_ID", "MISTRAL_API_KEY", "GEMINI_API_KEY", "GEMINI_MODEL",
 )
 
 
@@ -43,6 +43,7 @@ def ask(request, monkeypatch):
     for name in ("_ENV_BACKEND_URL", "_ENV_HTTP_PROXY", "_ENV_INSTANCE_ID", "_ENV_RELAY_TOKEN"):
         monkeypatch.setattr(module, name, "")
     monkeypatch.setattr(module, "_load_mistral_api_key", lambda: "")
+    monkeypatch.setattr(module, "_load_gemini_api_key", lambda: "")
     # Never install or start a real Tailscale from a test.
     monkeypatch.setattr(module, "_ensure_tailnet", lambda hostname: ("running", "100.64.0.2"))
     monkeypatch.setattr(module.utils, "get_args_raw", lambda message: message.args, raising=False)
@@ -65,6 +66,42 @@ def run(awaitable):
 
 def message(args="", sender_id=1000, chat_id=1000):
     return types.SimpleNamespace(args=args, sender_id=sender_id, chat_id=chat_id, id=5)
+
+
+def test_gemini_config(ask):
+    module, bot = ask.module, ask.bot
+    assert module.GEMINI_API_KEY == ""
+    assert module.GEMINI_MODEL == "gemini-2.5-flash-lite"
+    bot.config["gemini_api_key"] = "test-gemini-key"
+    bot.config["gemini_model"] = "test-model"
+    bot._apply_config()
+    assert module.GEMINI_API_KEY == "test-gemini-key"
+    assert module.GEMINI_MODEL == "test-model"
+
+
+def test_gemini_request_and_response_helpers(ask):
+    module = ask.module
+    for extension, mime in {
+        "ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/ogg",
+        "wav": "audio/wav", "mp3": "audio/mp3", "m4a": "audio/m4a",
+        "aac": "audio/aac", "flac": "audio/flac", "webm": "audio/webm",
+        "other": "audio/ogg",
+    }.items():
+        body = module._gemini_build_request(b"abc", f"voice.{extension}")
+        assert body["contents"][0]["parts"][0]["inline_data"] == {
+            "mime_type": mime, "data": "YWJj",
+        }
+        assert body["generationConfig"] == {"temperature": 0}
+        assert "not an assistant" in body["system_instruction"]["parts"][0]["text"]
+
+    assert module._gemini_extract_text({"candidates": [{"content": {"parts": [
+        {"text": "hello"}, {"text": " world"},
+    ]}}]}) == "hello world"
+    assert module._gemini_extract_text({"candidates": [{"content": {"parts": []}}]}) == ""
+    with pytest.raises(ValueError, match="no transcription candidates"):
+        module._gemini_extract_text({"candidates": []})
+    with pytest.raises(ValueError, match="prompt blocked: SAFETY"):
+        module._gemini_extract_text({"promptFeedback": {"blockReason": "SAFETY"}})
 
 
 def test_fresh_module_assumes_nothing_and_says_how_to_set_up(ask):
