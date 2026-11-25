@@ -71,7 +71,7 @@ def message(args="", sender_id=1000, chat_id=1000):
 def test_gemini_config(ask):
     module, bot = ask.module, ask.bot
     assert module.GEMINI_API_KEY == ""
-    assert module.GEMINI_MODEL == "gemini-2.5-flash-lite"
+    assert module.GEMINI_MODEL == "gemini-3.5-flash-lite"
     bot.config["gemini_api_key"] = "test-gemini-key"
     bot.config["gemini_model"] = "test-model"
     bot._apply_config()

@@ -30,7 +30,7 @@
  "cancelled": "Abgebrochen",
  "cfg_backend_url": "Adresse der Queue (relay) des Backends, zum Beispiel http://127.0.0.1:9092. Einfacher über .@@X@@asknet zu setzen",
 "cfg_gemini_api_key": "Google AI Studio-Schlüssel (Gemini) zum Transkribieren von Sprachnachrichten. Primär; Mistral als Ersatz. Leer – nur Mistral wird verwendet",
-"cfg_gemini_model": "Gemini-Modell zum Transkribieren von Sprachnachrichten (Standard: gemini-2.5-flash-lite)",
+"cfg_gemini_model": "Gemini-Modell zum Transkribieren von Sprachnachrichten (Standard: gemini-3.5-flash-lite)",
  "cfg_http_proxy": "HTTP-Proxy zum relay. Leer – direkte Verbindung; für ein tailnet ohne /dev/net/tun – http://localhost:1056",
  "cfg_instance_id": "Kennung dieses Userbots auf dem Backend (wird von setup.sh ausgegeben)",
  "cfg_language": "Sprache des Moduls und der Jarvis-Persona: auto (wie beim Userbot), en, ru, uk, kk oder de. Beim Wechsel wird die Standard-Persona durch die Übersetzung aus dem Repository ersetzt, eine bearbeitete wird vom Modell übersetzt",

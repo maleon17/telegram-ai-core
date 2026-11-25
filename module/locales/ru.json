@@ -30,7 +30,7 @@
  "cancelled": "Отменено",
  "cfg_backend_url": "Адрес очереди (relay) бэкенда, например http://127.0.0.1:9092. Проще задать через .@@X@@asknet",
 "cfg_gemini_api_key": "Ключ Google AI Studio (Gemini) для расшифровки голосовых. Основной движок; Mistral — запасной. Пусто — используется только Mistral",
-"cfg_gemini_model": "Модель Gemini для расшифровки голосовых (по умолчанию: gemini-2.5-flash-lite)",
+"cfg_gemini_model": "Модель Gemini для расшифровки голосовых (по умолчанию: gemini-3.5-flash-lite)",
  "cfg_http_proxy": "HTTP-прокси до relay. Пусто — прямое соединение; для tailnet без /dev/net/tun — http://localhost:1056",
  "cfg_instance_id": "Идентификатор этого юзербота на бэкенде (его печатает setup.sh)",
  "cfg_language": "Язык модуля и персоны Jarvis: auto (как у юзербота), en, ru, uk, kk или de. При смене дефолтная персона заменяется переводом из репозитория, изменённая — переводится моделью",
