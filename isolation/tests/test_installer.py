@@ -217,5 +217,38 @@ class MigratorInputTests(unittest.TestCase):
         self.assertNotIn("bad project name", self.run_plan("Project-1.2").stderr)
 
 
+class BackupGuardTests(unittest.TestCase):
+    """Backups share the root disk with the system: they must refuse to eat the last free space."""
+
+    def setUp(self):
+        self.helper = load_helper("tenant-backup")
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        self.helper.ROOT, self.helper.DEST = str(base / "tenants"), str(base / "dest")
+        home = base / "tenants" / "123456"
+        (home / "workspace").mkdir(parents=True)
+        (home / "workspace" / "data.bin").write_bytes(b"x" * 4096)
+        (home / "cache").mkdir()
+        (home / "cache" / "skipped.bin").write_bytes(b"y" * 1_000_000)
+
+    def test_estimate_skips_cache_dirs(self):
+        self.assertEqual(self.helper.estimate_bytes(str(Path(self.helper.ROOT) / "123456")), 4096)
+
+    def test_snapshot_refused_when_free_space_is_short(self):
+        usage = mock.Mock(free=self.helper.MIN_FREE_BYTES + 100)  # floor + less than the 4096 bytes of data
+        with mock.patch.object(self.helper.shutil, "disk_usage", return_value=usage):
+            with self.assertRaises(RuntimeError):
+                self.helper.snapshot("123456", "20260101-000000")
+        self.assertEqual(list(Path(self.helper.DEST, "123456").glob("*")), [])
+
+    def test_snapshot_written_when_space_is_enough(self):
+        usage = mock.Mock(free=self.helper.MIN_FREE_BYTES + 10 * 2**20)
+        with mock.patch.object(self.helper.shutil, "disk_usage", return_value=usage):
+            path = self.helper.snapshot("123456", "20260101-000000")
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+
 if __name__ == "__main__":
     unittest.main()

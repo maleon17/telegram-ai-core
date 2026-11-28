@@ -8,6 +8,7 @@ loss of the disk: copy DEST off the machine if that matters.
 """
 import os
 import re
+import shutil
 import sys
 import tarfile
 import time
@@ -15,24 +16,47 @@ import time
 ROOT = os.environ.get("TENANTS_ROOT", "/srv/ai-tenants")
 DEST = os.environ.get("TENANT_BACKUP_DEST", "/var/backups/ai-tenants/daily")
 KEEP = 7
+# Never let backups fill the disk that holds them: a tenant is skipped unless free space stays above this
+# floor after the (uncompressed) size of its data.
+MIN_FREE_BYTES = int(float(os.environ.get("TENANT_BACKUP_MIN_FREE_GB", "8")) * 1024 ** 3)
 SKIP_NAMES = {".exchange", "cache", ".cache", "node_modules", "__pycache__", ".tmp", "tmp", "shell-snapshots"}
 ID_RE = re.compile(r"^[0-9]{5,15}$")
+
+
+def estimate_bytes(home):
+    """Uncompressed size of what would be archived (symlinks not followed, skipped names pruned)."""
+    total = 0
+    for root, dirs, files in os.walk(home):
+        dirs[:] = [d for d in dirs if d not in SKIP_NAMES]
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
 
 
 def snapshot(tid, stamp):
     home = os.path.join(ROOT, tid)
     out_dir = os.path.join(DEST, tid)
     os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    free, need = shutil.disk_usage(out_dir).free, estimate_bytes(home) + MIN_FREE_BYTES
+    if free < need:
+        raise RuntimeError(f"skipped: {free // 2**20} MiB free, {need // 2**20} MiB needed to keep the disk safe")
     final = os.path.join(out_dir, f"{stamp}.tar.gz")
     temporary = final + ".part"
 
     def keep(info):
         return None if os.path.basename(info.name) in SKIP_NAMES else info
 
-    with tarfile.open(temporary, "w:gz") as archive:
-        archive.add(home, arcname=tid, filter=keep)
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, final)
+    try:
+        with tarfile.open(temporary, "w:gz") as archive:
+            archive.add(home, arcname=tid, filter=keep)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, final)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     old = sorted(n for n in os.listdir(out_dir) if n.endswith(".tar.gz"))[:-KEEP]
     for name in old:
         os.unlink(os.path.join(out_dir, name))
