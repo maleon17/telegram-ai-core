@@ -204,10 +204,16 @@ def copy(tid, project):
     if os.path.isfile(f"{xsrc}/handoff.md"):
         cp(f"{xsrc}/handoff.md", f"{xdst}/handoff.md")
     # --- ownership of everything that went into the tenant ---
-    for target in (cdst, xdst, wdst):
+    # Only what this run wrote: the two config directories and the project directory it placed in workspace/.
+    # The rest of workspace/ must NOT be touched: for an administrator tenant it holds repositories that other
+    # accounts (the services) still own and run from, and a recursive chown/chmod there takes them away.
+    targets = [cdst, xdst] + ([f"{wdst}/{project}"] if project else [])
+    for target in targets:
         if os.path.exists(target):
             sh(["chown", "-R", f"{uid}:{gid}", target])
             sh(["chmod", "-R", "u+rwX,go-rwx", target])
+    if os.path.isdir(wdst) and os.stat(wdst).st_uid == 0:  # created by this run (not by provisioning)
+        sh(["chown", f"{uid}:{gid}", wdst])
     for name in (".credentials.json",):
         if os.path.exists(f"{cdst}/{name}"):
             os.chmod(f"{cdst}/{name}", 0o600)

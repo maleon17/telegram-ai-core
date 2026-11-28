@@ -1,5 +1,6 @@
 """Root-free checks of the published isolation staging and helper contracts."""
 import hashlib
+import json
 import importlib.machinery
 import importlib.util
 import os
@@ -344,6 +345,55 @@ class AdministratorRoleTests(unittest.TestCase):
             called = any(c.args and c.args[0] == self.run_helper.PR_SET_NO_NEW_PRIVS for c in libc.prctl.call_args_list)
             self.assertEqual(called, expect_call, role)
             execve.assert_called_once()
+
+
+class MigratorOwnershipScopeTests(unittest.TestCase):
+    """`copy` must change ownership and modes only of what it wrote (regression: it recursed over the whole workspace,
+    taking live repositories away from the services' account in an administrator tenant)."""
+
+    def run_copy(self, project):
+        m1 = load_helper("m1-migrate-tenant")
+        base = Path(tempfile.mkdtemp(dir=Path(__file__).parent))
+        self.addCleanup(shutil.rmtree, base, True)
+        home, tenant = base / "home", base / "tenants" / "123456"
+        for rel in ("workspace/dev/live-repo", ".claude-bridge", ".codex-bridge"):
+            (tenant / rel).mkdir(parents=True)
+        (tenant / "workspace/dev/live-repo/code.py").write_text("x")
+        account = home / "claude" / "accounts" / "123456"
+        (account / "projects").mkdir(parents=True)
+        (account / ".credentials.json").write_text("{}")
+        if project:
+            (account / project).mkdir()
+            (account / project / "file.txt").write_text("p")
+        m1.HOME, m1.TENANTS_ROOT, m1.BRIDGE_USER = str(home), str(base / "tenants"), pwd.getpwuid(os.getuid()).pw_name
+        m1.BRIDGES = {"claude": {"account": str(home / "claude" / "accounts" / "{id}"), "control": str(base / "cc" / "{id}"),
+                                 "state": str(base / "s1.json")},
+                      "codex": {"account": str(home / "codex" / "accounts" / "{id}"), "control": str(base / "xc" / "{id}"),
+                                "state": str(base / "s2.json")}}
+        calls = []
+
+        def fake_sh(cmd):
+            calls.append(list(cmd))
+            if cmd[0].endswith("tenant-provision"):
+                return mock.Mock(returncode=0, stdout=json.dumps({"uid": os.getuid(), "gid": os.getgid()}), stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(m1, "sh", side_effect=fake_sh), mock.patch.object(m1.os, "chown"):
+            m1.copy("123456", project)
+        return calls, str(tenant / "workspace")
+
+    def touched(self, calls):
+        return [c[-1] for c in calls if c and c[0] in ("chown", "chmod") and c[-1].startswith("/")]
+
+    def test_workspace_is_not_walked_without_a_project(self):
+        calls, workspace = self.run_copy(None)
+        offenders = [p for p in self.touched(calls) if p == workspace + "/" or p.startswith(workspace + "/")]
+        self.assertEqual(offenders, [])
+
+    def test_only_the_project_directory_is_changed_inside_workspace(self):
+        calls, workspace = self.run_copy("SunDay")
+        inside = [p for p in self.touched(calls) if p.startswith(workspace + "/")]
+        self.assertEqual(sorted(set(inside)), [workspace + "/SunDay"])
+        self.assertTrue(all("live-repo" not in p for p in self.touched(calls)))
 
 
 class MigratorInputTests(unittest.TestCase):
