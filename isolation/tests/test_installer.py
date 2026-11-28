@@ -267,6 +267,8 @@ class AdministratorRoleTests(unittest.TestCase):
                 self.conf(ADMIN_GROUP=bad)
 
     def test_sudoers_entry_is_validated_idempotent_and_revocable(self):
+        old_umask = os.umask(0o077)  # tenant-provision runs with this umask; it must not weaken the entry's mode
+        self.addCleanup(os.umask, old_umask)
         with mock.patch.object(self.provision, "run", side_effect=self.fake_run):
             self.provision.apply_sudoers("t123456", "admin")
             path = self.sudoers / "94-tenant-admin-t123456"

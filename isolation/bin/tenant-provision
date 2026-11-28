@@ -208,6 +208,7 @@ def apply_sudoers(user, role):
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o440)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o440)  # the process umask (077) would otherwise turn 0440 into 0400
             handle.write(sudoers_text(user))
             handle.flush()
             os.fsync(handle.fileno())
