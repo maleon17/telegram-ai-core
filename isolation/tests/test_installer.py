@@ -281,6 +281,15 @@ class AdministratorRoleTests(unittest.TestCase):
         setquota = next(c for c in calls if c[0].endswith("setquota"))
         self.assertEqual(setquota[3:5], [str(12582912 * 7 // 8), "12582912"])
 
+    def test_administrator_workspace_keeps_the_acl_mask_open(self):
+        # regression: ensure ran chmod 0700 on workspace each time, zeroing the ACL mask that carries the service
+        # account's access to the repositories placed there
+        for sub in ("workspace", ".private"):
+            self.assertEqual(self.provision.dir_mode("admin", sub), 0o750)
+            self.assertEqual(self.provision.dir_mode("member", sub), 0o700)
+        for sub in (".claude-bridge", ".codex-bridge", ".auth", ".claude-delegate"):
+            self.assertEqual(self.provision.dir_mode("admin", sub), 0o700)
+
     def test_sudoers_entry_is_validated_idempotent_and_revocable(self):
         old_umask = os.umask(0o077)  # tenant-provision runs with this umask; it must not weaken the entry's mode
         self.addCleanup(os.umask, old_umask)

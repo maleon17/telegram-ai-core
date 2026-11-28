@@ -198,6 +198,17 @@ def sudoers_ok(user, role):
         return False
 
 
+def dir_mode(role, sub):
+    """Mode of a directory directly under the tenant home.
+
+    Administrators keep their code and working materials in workspace/ and the service account (a member of the
+    administrator group, or holding an ACL entry) must reach it. With an ACL entry the group bits of a directory are
+    the ACL mask, so chmod 0700 on every ensure call would zero the mask and silently take that access away.
+    workspace/ and .private/ therefore stay 0750 for administrators; everything else is private to the tenant.
+    """
+    return 0o750 if role == "admin" and sub in ("workspace", ".private") else 0o700
+
+
 def apply_sudoers(user, role):
     path = sudoers_path(user)
     if role != "admin":
@@ -409,7 +420,7 @@ def provision(conf, tid, kind):
         os.close(root_fd)
     try:
         for sub in HIDDEN_DIRS + VISIBLE_DIRS:
-            ensure_dir(home_fd, sub, pw.pw_uid, pw.pw_gid, 0o700)
+            ensure_dir(home_fd, sub, pw.pw_uid, pw.pw_gid, dir_mode(role, sub))
         share_codex_auth_with_delegate(home_fd, pw)
         if conf["_bridge_gid"] is not None:
             setup_exchange(conf, home_fd, pw)
