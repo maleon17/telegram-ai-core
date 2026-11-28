@@ -269,7 +269,7 @@ if [[ -n $claude_bridge ]]; then
     done
 fi
 if [[ -n $codex_bot ]]; then
-    for script in codex_send_telegram_file_mcp.py delegate_to_claude_exchange_mcp.py; do
+    for script in codex_send_telegram_file_mcp.py codex_rename_session_mcp.py delegate_to_claude_exchange_mcp.py; do
         src="$codex_bot/$script"; [[ -f $src ]] || die "missing bridge MCP: $src"
         write_file "$src" "/opt/telegram-ai/mcp/$script" 0644
     done

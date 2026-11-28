@@ -42,7 +42,7 @@ class InstallerTests(unittest.TestCase):
             (self.claude / "isolation/tools" / name).write_text("#!/usr/bin/python3\n")
         for name in ("send_telegram_file_mcp.py", "delegate_to_codex_exchange_mcp.py"):
             (self.claude / name).write_text("#!/usr/bin/python3\n")
-        for name in ("codex_send_telegram_file_mcp.py", "delegate_to_claude_exchange_mcp.py"):
+        for name in ("codex_send_telegram_file_mcp.py", "codex_rename_session_mcp.py", "delegate_to_claude_exchange_mcp.py"):
             (self.codex / name).write_text("#!/usr/bin/python3\n")
         self.args = [str(INSTALL), "--bridge-user", pwd.getpwuid(os.getuid()).pw_name,
                      "--destdir", str(self.stage), "--claude-bridge", str(self.claude),

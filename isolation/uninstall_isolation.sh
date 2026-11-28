@@ -33,7 +33,7 @@ files=(
     /opt/telegram-ai/mcp/send_telegram_file_mcp.py
     /opt/telegram-ai/mcp/delegate_to_codex_exchange_mcp.py
     /opt/telegram-ai/mcp/brokered_mcp_exchange_mcp.py
-    /opt/telegram-ai/mcp/codex_send_telegram_file_mcp.py
+    /opt/telegram-ai/mcp/codex_send_telegram_file_mcp.py /opt/telegram-ai/mcp/codex_rename_session_mcp.py
     /opt/telegram-ai/mcp/delegate_to_claude_exchange_mcp.py
 )
 for path in "${files[@]}"; do
