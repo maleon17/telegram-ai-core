@@ -50,6 +50,8 @@ DEFAULTS = {
     # promote anybody. Full trust in these people is the point of the role.
     "ADMIN_IDS": "",
     "ADMIN_GROUP": "aitenants-admin",
+    # Disk quota of administrator tenants in KiB (0 = same as DISK_QUOTA_KB): they hold repositories and work materials.
+    "ADMIN_DISK_QUOTA_KB": "0",
 }
 ID_RE = re.compile(r"^[0-9]{5,15}$")
 PREFIX_RE = re.compile(r"^[a-z][a-z0-9_-]{0,7}$")
@@ -119,10 +121,11 @@ def validate_conf(conf):
     conf["_lo"], conf["_hi"] = lo, hi
     try:
         conf["_quota_kb"], conf["_inodes"] = int(conf["DISK_QUOTA_KB"]), int(conf["DISK_INODES"])
+        conf["_admin_quota_kb"] = int(conf["ADMIN_DISK_QUOTA_KB"])
     except ValueError:
-        die("DISK_QUOTA_KB/DISK_INODES must be integers")
-    if conf["_quota_kb"] < 0 or conf["_inodes"] < 0:
-        die("DISK_QUOTA_KB/DISK_INODES must not be negative")
+        die("DISK_QUOTA_KB/DISK_INODES/ADMIN_DISK_QUOTA_KB must be integers")
+    if conf["_quota_kb"] < 0 or conf["_inodes"] < 0 or conf["_admin_quota_kb"] < 0:
+        die("DISK_QUOTA_KB/DISK_INODES/ADMIN_DISK_QUOTA_KB must not be negative")
     admins = [item.strip() for item in conf["ADMIN_IDS"].split(",") if item.strip()]
     for item in admins:
         if not ID_RE.fullmatch(item):
@@ -328,13 +331,21 @@ def setup_exchange(conf, home_fd, pw):
             die(f"setfacl failed: {res.stderr.strip()[:200]}")
 
 
-def apply_disk_quota(conf, home, uid, tree_done):
+def quota_for(conf, role):
+    """Hard block limit for a role: administrators may have their own (larger) one."""
+    if role == "admin" and conf["_admin_quota_kb"] > 0:
+        return conf["_admin_quota_kb"]
+    return conf["_quota_kb"]
+
+
+def apply_disk_quota(conf, home, uid, tree_done, hard_kb=None):
     """Per-tenant disk limit: put the whole home tree into project <uid> and set the project's limit.
 
     The slow tree pass runs once (tree_done comes from the registry record); afterwards new files inherit the
     project from their directory, so only the cheap limit call is repeated. Returns True when the tree is done.
     """
-    hard_kb, inodes = conf["_quota_kb"], conf["_inodes"]
+    hard_kb = conf["_quota_kb"] if hard_kb is None else hard_kb
+    inodes = conf["_inodes"]
     if hard_kb <= 0:
         return False
     if not tree_done:
@@ -410,15 +421,16 @@ def provision(conf, tid, kind):
             previous = json.load(handle)
     except (OSError, ValueError):
         previous = {}
-    tree_done = previous.get("quota_kb") == conf["_quota_kb"] and bool(previous.get("quota_tree"))
-    quota_applied = apply_disk_quota(conf, home, pw.pw_uid, tree_done)
+    hard_kb = quota_for(conf, role)
+    tree_done = previous.get("quota_kb") == hard_kb and bool(previous.get("quota_tree"))
+    quota_applied = apply_disk_quota(conf, home, pw.pw_uid, tree_done, hard_kb)
 
     os.makedirs(reg_dir, mode=0o700, exist_ok=True)
     os.chmod(reg_dir, 0o700)
     record = {"id": tid, "kind": kind, "user": user, "uid": pw.pw_uid, "gid": pw.pw_gid,
               "home": home, "layout_version": 1, "locked": False, "role": role}
     if quota_applied:
-        record["quota_kb"], record["quota_tree"] = conf["_quota_kb"], True
+        record["quota_kb"], record["quota_tree"] = hard_kb, True
     tmp = os.path.join(reg_dir, f".{user}.json.tmp")
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(record, handle)

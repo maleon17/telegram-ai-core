@@ -23,11 +23,28 @@ SKIP_NAMES = {".exchange", "cache", ".cache", "node_modules", "__pycache__", ".t
 ID_RE = re.compile(r"^[0-9]{5,15}$")
 
 
+NOBACKUP_MARKER = ".nobackup"
+
+
+def nobackup_dirs(home):
+    """Directories holding a .nobackup file are left out completely (code checkouts, caches of the owner's choosing)."""
+    found = set()
+    for root, dirs, files in os.walk(home):
+        dirs[:] = [d for d in dirs if d not in SKIP_NAMES]
+        if NOBACKUP_MARKER in files:
+            found.add(root)
+            dirs[:] = []
+    return found
+
+
 def estimate_bytes(home):
     """Uncompressed size of what would be archived (symlinks not followed, skipped names pruned)."""
     total = 0
+    skipped = nobackup_dirs(home)
     for root, dirs, files in os.walk(home):
-        dirs[:] = [d for d in dirs if d not in SKIP_NAMES]
+        dirs[:] = [d for d in dirs if d not in SKIP_NAMES and os.path.join(root, d) not in skipped]
+        if root in skipped:
+            continue
         for name in files:
             try:
                 total += os.lstat(os.path.join(root, name)).st_size
@@ -46,8 +63,14 @@ def snapshot(tid, stamp):
     final = os.path.join(out_dir, f"{stamp}.tar.gz")
     temporary = final + ".part"
 
+    skipped_arc = {os.path.join(tid, os.path.relpath(d, home)) for d in nobackup_dirs(home) if d != home}
+
     def keep(info):
-        return None if os.path.basename(info.name) in SKIP_NAMES else info
+        if os.path.basename(info.name) in SKIP_NAMES:
+            return None
+        if any(info.name == d or info.name.startswith(d + "/") for d in skipped_arc):
+            return None
+        return info
 
     try:
         with tarfile.open(temporary, "w:gz") as archive:

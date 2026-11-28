@@ -266,6 +266,20 @@ class AdministratorRoleTests(unittest.TestCase):
             with self.assertRaises(SystemExit, msg=bad):
                 self.conf(ADMIN_GROUP=bad)
 
+    def test_administrators_may_have_their_own_disk_quota(self):
+        conf = self.conf(ADMIN_IDS="123456", DISK_QUOTA_KB="4194304", ADMIN_DISK_QUOTA_KB="12582912")
+        self.assertEqual(self.provision.quota_for(conf, "member"), 4194304)
+        self.assertEqual(self.provision.quota_for(conf, "admin"), 12582912)
+        same = self.conf(ADMIN_IDS="123456", DISK_QUOTA_KB="4194304")
+        self.assertEqual(self.provision.quota_for(same, "admin"), 4194304)
+        with self.assertRaises(SystemExit):
+            self.conf(ADMIN_DISK_QUOTA_KB="-1")
+        calls = []
+        with mock.patch.object(self.provision, "run", side_effect=lambda c: (calls.append(c) or mock.Mock(returncode=0, stderr="", stdout=""))):
+            self.provision.apply_disk_quota(conf, "/tenants/123456", 20005, True, 12582912)
+        setquota = next(c for c in calls if c[0].endswith("setquota"))
+        self.assertEqual(setquota[3:5], [str(12582912 * 7 // 8), "12582912"])
+
     def test_sudoers_entry_is_validated_idempotent_and_revocable(self):
         old_umask = os.umask(0o077)  # tenant-provision runs with this umask; it must not weaken the entry's mode
         self.addCleanup(os.umask, old_umask)
@@ -364,6 +378,22 @@ class BackupGuardTests(unittest.TestCase):
 
     def test_estimate_skips_cache_dirs(self):
         self.assertEqual(self.helper.estimate_bytes(str(Path(self.helper.ROOT) / "123456")), 4096)
+
+    def test_nobackup_marker_excludes_a_directory_tree(self):
+        home = Path(self.helper.ROOT) / "123456"
+        (home / "workspace" / "dev" / "repo").mkdir(parents=True)
+        (home / "workspace" / "dev" / ".nobackup").write_text("")
+        (home / "workspace" / "dev" / "repo" / "code.py").write_bytes(b"c" * 100000)
+        self.assertEqual(self.helper.estimate_bytes(str(home)), 4096)
+        usage = mock.Mock(free=self.helper.MIN_FREE_BYTES + 10 * 2**20)
+        with mock.patch.object(self.helper.shutil, "disk_usage", return_value=usage):
+            path = self.helper.snapshot("123456", "20260101-000001")
+        import tarfile
+        with tarfile.open(path) as archive:
+            names = archive.getnames()
+        self.assertTrue(any(n.endswith("workspace/data.bin") for n in names))
+        self.assertFalse(any("/dev/" in n and n.endswith("code.py") for n in names))
+        self.assertFalse(any(n.endswith("workspace/dev/repo") for n in names))
 
     def test_snapshot_refused_when_free_space_is_short(self):
         usage = mock.Mock(free=self.helper.MIN_FREE_BYTES + 100)  # floor + less than the 4096 bytes of data
