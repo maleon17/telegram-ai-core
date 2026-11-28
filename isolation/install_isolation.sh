@@ -217,11 +217,12 @@ if [[ -z $destdir && $check -eq 0 && $dry_run -eq 0 && $image_size != none ]]; t
     chmod 0711 "$tenants_root"
 fi
 
-for helper in tenant-provision tenant-run tenant-firewall tenant-backup m1-migrate-tenant; do
+for helper in tenant-provision tenant-run tenant-firewall tenant-backup tenant-role m1-migrate-tenant; do
     write_file "$SOURCE_DIR/bin/$helper" "/usr/local/sbin/$helper" 0755
 done
 write_file "$SOURCE_DIR/sudoers/92-tenant-provision.in" /etc/sudoers.d/92-tenant-provision 0440
 write_file "$SOURCE_DIR/sudoers/93-tenant-run.in" /etc/sudoers.d/93-tenant-run 0440
+write_file "$SOURCE_DIR/sudoers/95-tenant-role.in" /etc/sudoers.d/95-tenant-role 0440
 for unit in ai-tenants-firewall.service ai-tenants-backup.service ai-tenants-backup.timer; do
     write_file "$SOURCE_DIR/systemd/$unit" "/etc/systemd/system/$unit" 0644
 done

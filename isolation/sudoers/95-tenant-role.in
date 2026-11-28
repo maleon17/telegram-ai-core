@@ -1,0 +1,3 @@
+# The bridge may ask tenant-role to list, grant or revoke the administrator role. The helper validates the id, refuses to
+# revoke administrators fixed in tenants.conf and writes every change to the system log.
+@BRIDGE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/tenant-role list, /usr/local/sbin/tenant-role grant *, /usr/local/sbin/tenant-role revoke *

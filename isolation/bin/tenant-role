@@ -1,0 +1,208 @@
+#!/usr/bin/python3
+"""tenant-role: grant and revoke the administrator role of a tenant at run time.
+
+Root-owned helper, called through a narrow sudoers rule by the bridge when the owner presses a button in Telegram.
+The list of administrators lives in a root-owned file (ADMINS_FILE) that the bridge cannot write; this helper is the
+only way to change it. It accepts nothing but a validated Telegram id:
+
+    tenant-role list
+    tenant-role grant  <id>
+    tenant-role revoke <id>
+
+grant   adds the id to ADMINS_FILE, stops the tenant's processes, moves its Unix user into the administrator group
+        (re-grouping the home tree without following links, except the bridge's .exchange) and runs
+        `tenant-provision ensure`, which installs the sudoers entry and the administrator limits.
+revoke  does the reverse and removes the sudoers entry; the person stays a member with all data.
+Administrators listed in ADMIN_IDS in tenants.conf (the owner, co-administrators set at install time) can never be
+revoked here. Every change is written to the system log with the invoking user.
+"""
+import fcntl
+import grp
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import stat
+import subprocess
+import sys
+import syslog
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def _load_provision():
+    loader = importlib.machinery.SourceFileLoader("tenant_provision", os.path.join(HERE, "tenant-provision"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+P = _load_provision()
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+
+
+def die(msg, code=2):
+    P.die(msg, code)
+
+
+def caller():
+    return os.environ.get("SUDO_USER") or "root"
+
+
+def load():
+    conf = P.load_conf()
+    P.validate_conf(conf)
+    return conf
+
+
+def write_admins(path, ids):
+    """Atomic replace; root:root 0600. The directory is root-owned (/etc/telegram-ai)."""
+    directory = os.path.dirname(path)
+    temporary = os.path.join(directory, f".admins.{os.getpid()}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write("# Managed by tenant-role. Do not edit while the bridge runs.\n")
+            for item in sorted(ids):
+                handle.write(item + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chown(temporary, 0, 0)
+        os.replace(temporary, path)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
+MAX_DEPTH = 256
+
+
+def _regroup(fd, gid, top, skip, depth):
+    count = 0
+    with os.scandir(fd) as entries:
+        names = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in entries]
+    for name, is_dir in names:
+        if top and name in skip:
+            continue
+        try:
+            os.chown(name, -1, gid, dir_fd=fd, follow_symlinks=False)
+        except OSError:
+            continue  # vanished or replaced while walking: never worth following
+        count += 1
+        if is_dir and depth < MAX_DEPTH:
+            try:
+                child = os.open(name, DIR_FLAGS, dir_fd=fd)
+            except OSError:
+                continue
+            try:
+                count += _regroup(child, gid, False, skip, depth + 1)
+            finally:
+                os.close(child)
+    return count
+
+
+def regroup_tree(home, gid, skip=(".exchange",)):
+    """chgrp the whole home tree to gid through file descriptors: nothing is followed, so a tenant cannot plant a link
+    and make this root helper change the group of a file elsewhere. The top-level names in `skip` are left alone."""
+    root_fd = os.open(home, DIR_FLAGS)
+    try:
+        os.chown(".", -1, gid, dir_fd=root_fd, follow_symlinks=False)
+        return _regroup(root_fd, gid, True, skip, 0)
+    finally:
+        os.close(root_fd)
+
+
+def run_cmd(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, env=SAFE_ENV)
+
+
+def stop_processes(user):
+    run_cmd(["/usr/bin/pkill", "-KILL", "-u", user])
+
+
+def retag(conf, tid, to_group):
+    """Move an existing tenant user to another primary group; a missing user needs nothing (ensure creates it)."""
+    user, home = P.names(conf, tid, "main")
+    try:
+        pwd.getpwnam(user)
+    except KeyError:
+        return {"user": user, "existed": False, "regrouped": 0}
+    gid = grp.getgrnam(to_group).gr_gid
+    stop_processes(user)
+    res = run_cmd(["/usr/sbin/usermod", "-g", to_group, user])
+    if res.returncode != 0:
+        die(f"usermod failed: {res.stderr.strip()[:200]}")
+    count = regroup_tree(home, gid) if os.path.isdir(home) else 0
+    return {"user": user, "existed": True, "regrouped": count}
+
+
+def converge(tid):
+    conf = load()
+    return P.provision(conf, tid, "main")
+
+
+def with_lock(conf, action):
+    os.makedirs(conf["REGISTRY_DIR"], mode=0o700, exist_ok=True)
+    with open(os.path.join(conf["REGISTRY_DIR"], ".role.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return action()
+
+
+def cmd_list(conf, _tid):
+    return {"static": sorted(conf["_static_admins"]),
+            "dynamic": sorted(conf["_admins"] - conf["_static_admins"])}
+
+
+def cmd_grant(conf, tid):
+    if tid in conf["_admins"]:
+        record = converge(tid)
+        return {"id": tid, "role": record["role"], "changed": False}
+    dynamic = set(conf["_admins"] - conf["_static_admins"]) | {tid}
+    write_admins(conf["ADMINS_FILE"], dynamic)
+    result = retag(load(), tid, load()["ADMIN_GROUP"])
+    record = converge(tid)
+    syslog.syslog(syslog.LOG_AUTH | syslog.LOG_NOTICE, f"granted the administrator role to {tid} (requested by {caller()})")
+    return {"id": tid, "role": record["role"], "changed": True, **result}
+
+
+def cmd_revoke(conf, tid):
+    if tid in conf["_static_admins"]:
+        die("administrators listed in ADMIN_IDS cannot be revoked here")
+    if tid not in conf["_admins"]:
+        record = converge(tid)
+        return {"id": tid, "role": record["role"], "changed": False}
+    dynamic = set(conf["_admins"] - conf["_static_admins"]) - {tid}
+    write_admins(conf["ADMINS_FILE"], dynamic)
+    result = retag(load(), tid, load()["TENANT_GROUP"])
+    record = converge(tid)
+    syslog.syslog(syslog.LOG_AUTH | syslog.LOG_NOTICE, f"revoked the administrator role of {tid} (requested by {caller()})")
+    return {"id": tid, "role": record["role"], "changed": True, **result}
+
+
+def main(argv):
+    syslog.openlog("tenant-role", 0, syslog.LOG_AUTH)
+    os.umask(0o077)
+    if os.geteuid() != 0:
+        die("must run as root")
+    args = argv[1:]
+    usage = "usage: tenant-role list | grant <id> | revoke <id>"
+    if not args or args[0] not in ("list", "grant", "revoke"):
+        die(usage)
+    action = args[0]
+    if (action == "list" and len(args) != 1) or (action != "list" and len(args) != 2):
+        die(usage)
+    tid = args[1] if len(args) == 2 else ""
+    if action != "list" and not P.ID_RE.fullmatch(tid):
+        die("the id must be 5 to 15 digits")
+    conf = load()
+    handler = {"list": cmd_list, "grant": cmd_grant, "revoke": cmd_revoke}[action]
+    result = with_lock(conf, lambda: handler(load() if action != "list" else conf, tid))
+    print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main(sys.argv)

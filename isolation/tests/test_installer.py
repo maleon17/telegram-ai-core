@@ -208,7 +208,7 @@ class ProvisionLogicTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_mount_requirement_and_config_validation(self):
-        conf = dict(self.helper.DEFAULTS, REQUIRE_MOUNT="1", TENANTS_ROOT="/tenants")
+        conf = dict(self.helper.DEFAULTS, REQUIRE_MOUNT="1", TENANTS_ROOT="/tenants", ADMINS_FILE="")
         with mock.patch.object(self.helper.os.path, "ismount", return_value=False):
             with self.assertRaises(SystemExit):
                 self.helper.validate_conf(conf)
@@ -246,7 +246,7 @@ class AdministratorRoleTests(unittest.TestCase):
         return mock.Mock(returncode=0, stderr="")
 
     def conf(self, **overrides):
-        conf = dict(self.provision.DEFAULTS, TENANTS_ROOT="/tenants", BRIDGE_GROUP="bridgeg", **overrides)
+        conf = dict(self.provision.DEFAULTS, TENANTS_ROOT="/tenants", BRIDGE_GROUP="bridgeg", ADMINS_FILE="", **overrides)
         fake_stat = mock.Mock(st_uid=0, st_mode=stat.S_IFDIR | 0o711)
         with mock.patch.object(self.provision.os, "lstat", return_value=fake_stat), \
                 mock.patch.object(self.provision.pwd, "getpwnam"), \
@@ -403,6 +403,105 @@ class MigratorOwnershipScopeTests(unittest.TestCase):
         inside = [p for p in self.touched(calls) if p.startswith(workspace + "/")]
         self.assertEqual(sorted(set(inside)), [workspace + "/SunDay"])
         self.assertTrue(all("live-repo" not in p for p in self.touched(calls)))
+
+
+class TenantRoleTests(unittest.TestCase):
+    """grant/revoke: only the root-owned file changes the list, statics are permanent, the home tree is re-grouped
+    without following links and without touching the bridge's .exchange."""
+
+    def setUp(self):
+        self.role = load_helper("tenant-role")
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        self.admins = base / "admins"
+        self.home = base / "tenants" / "123456"
+        (self.home / "work" / "deep").mkdir(parents=True)
+        (self.home / ".exchange" / "queue").mkdir(parents=True)
+        (self.home / "work" / "deep" / "f.txt").write_text("x")
+        self.outside = base / "outside.txt"
+        self.outside.write_text("secret")
+        (self.home / "work" / "link").symlink_to(self.outside)
+        self.conf_template = dict(
+            TENANTS_ROOT=str(base / "tenants"), USER_PREFIX="t", ADMIN_GROUP="adm", TENANT_GROUP="mem",
+            ADMINS_FILE=str(self.admins), REGISTRY_DIR=str(base / "reg"), _static_admins=frozenset({"999999"}))
+        self.calls, self.chowns, self.role_seen = [], [], []
+
+        def read_admins(path):
+            return frozenset(x.strip() for x in Path(path).read_text().splitlines() if x.strip() and not x.startswith("#")) \
+                if Path(path).exists() else frozenset()
+
+        def load():
+            conf = dict(self.conf_template)
+            conf["_admins"] = conf["_static_admins"] | read_admins(conf["ADMINS_FILE"])
+            return conf
+
+        def provision(conf, tid, kind):
+            role = "admin" if tid in conf["_admins"] else "member"
+            self.role_seen.append((tid, role))
+            return {"id": tid, "role": role}
+
+        def run_cmd(cmd):
+            self.calls.append(list(cmd))
+            return mock.Mock(returncode=0, stderr="", stdout="")
+
+        patches = [
+            mock.patch.object(self.role, "load", side_effect=load),
+            mock.patch.object(self.role.P, "provision", side_effect=provision),
+            mock.patch.object(self.role, "run_cmd", side_effect=run_cmd),
+            mock.patch.object(self.role.pwd, "getpwnam", return_value=mock.Mock()),
+            mock.patch.object(self.role.grp, "getgrnam", side_effect=lambda g: mock.Mock(gr_gid={"adm": 7001, "mem": 7002}[g])),
+            mock.patch.object(self.role.os, "chown", side_effect=lambda *a, **k: self.chowns.append((a, k))),
+            mock.patch.object(self.role.syslog, "syslog"),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_grant_adds_the_id_regroups_and_converges(self):
+        result = self.role.cmd_grant(self.role.load(), "123456")
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["role"], "admin")
+        self.assertIn("123456", self.admins.read_text().split())
+        self.assertEqual(stat.S_IMODE(self.admins.stat().st_mode), 0o600)
+        commands = [c[:3] for c in self.calls]
+        self.assertIn(["/usr/bin/pkill", "-KILL", "-u"], commands)       # processes stopped first
+        self.assertIn(["/usr/sbin/usermod", "-g", "adm"], commands)
+        names = {a[0] for a, k in self.chowns if len(a) > 0 and isinstance(a[0], str)}
+        self.assertIn("f.txt", names)
+        self.assertNotIn("queue", names)                                  # .exchange is skipped completely
+        self.assertNotIn(".exchange", names)
+        for args, kwargs in self.chowns:
+            if args and args[0] != "." and "dir_fd" in kwargs:
+                self.assertIs(kwargs.get("follow_symlinks"), False)       # links are never followed
+        self.assertTrue(all(str(self.outside) not in str(a) for a, _k in self.chowns))
+        # idempotent: a second grant changes nothing
+        self.calls.clear()
+        self.assertFalse(self.role.cmd_grant(self.role.load(), "123456")["changed"])
+        self.assertEqual([c for c in self.calls if "usermod" in c[0]], [])
+
+    def test_revoke_returns_to_member_and_keeps_the_person(self):
+        self.role.cmd_grant(self.role.load(), "123456")
+        self.calls.clear()
+        result = self.role.cmd_revoke(self.role.load(), "123456")
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["role"], "member")
+        self.assertNotIn("123456", self.admins.read_text().split())
+        self.assertIn(["/usr/sbin/usermod", "-g", "mem"], [c[:3] for c in self.calls])
+
+    def test_static_administrators_cannot_be_revoked(self):
+        with self.assertRaises(SystemExit):
+            self.role.cmd_revoke(self.role.load(), "999999")
+        listing = self.role.cmd_list(self.role.load(), "")
+        self.assertEqual(listing["static"], ["999999"])
+
+    def test_arguments_are_validated(self):
+        with mock.patch.object(self.role.os, "geteuid", return_value=0):
+            for argv in (["tenant-role"], ["tenant-role", "grant"], ["tenant-role", "grant", "12ab"],
+                         ["tenant-role", "grant", "123456", "extra"], ["tenant-role", "list", "1"],
+                         ["tenant-role", "delete", "123456"], ["tenant-role", "grant", "../etc"]):
+                with self.assertRaises(SystemExit, msg=argv):
+                    self.role.main(argv)
 
 
 class MigratorInputTests(unittest.TestCase):
