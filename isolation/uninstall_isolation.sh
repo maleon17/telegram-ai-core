@@ -29,7 +29,7 @@ files=(
     /etc/systemd/system/ai-tenants-backup.timer
     /etc/systemd/system/ai-tenants.slice.d/10-limits.conf
     /etc/systemd/system/ai-tenants-.slice.d/10-limits.conf
-    /opt/telegram-ai/tools/account-limits /opt/telegram-ai/tools/list-sessions
+    /opt/telegram-ai/tools/account-limits /opt/telegram-ai/tools/list-sessions /opt/telegram-ai/tools/session-title
     /opt/telegram-ai/mcp/send_telegram_file_mcp.py
     /opt/telegram-ai/mcp/delegate_to_codex_exchange_mcp.py
     /opt/telegram-ai/mcp/brokered_mcp_exchange_mcp.py

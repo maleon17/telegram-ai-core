@@ -38,7 +38,7 @@ class InstallerTests(unittest.TestCase):
         self.codex = self.base / "codex-bot"
         (self.claude / "isolation/tools").mkdir(parents=True)
         self.codex.mkdir()
-        for name in ("account-limits", "list-sessions"):
+        for name in ("account-limits", "list-sessions", "session-title"):
             (self.claude / "isolation/tools" / name).write_text("#!/usr/bin/python3\n")
         for name in ("send_telegram_file_mcp.py", "delegate_to_codex_exchange_mcp.py"):
             (self.claude / name).write_text("#!/usr/bin/python3\n")
@@ -68,7 +68,7 @@ class InstallerTests(unittest.TestCase):
             path = self.stage / "etc/sudoers.d" / name
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o440)
             self.assertIn(pwd.getpwuid(os.getuid()).pw_name, path.read_text())
-        for name in ("account-limits", "list-sessions"):
+        for name in ("account-limits", "list-sessions", "session-title"):
             self.assertEqual(stat.S_IMODE((self.stage / "opt/telegram-ai/tools" / name).stat().st_mode), 0o755)
         self.assertTrue((self.stage / "opt/telegram-ai/mcp/delegate_to_claude_exchange_mcp.py").exists())
         self.assertIn("RequiresMountsFor=/srv/ai-tenants", (self.stage / "etc/systemd/system/ai-tenants-backup.service").read_text())

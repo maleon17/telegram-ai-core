@@ -258,7 +258,7 @@ if [[ $image_size != none ]]; then
 fi
 
 if [[ -n $claude_bridge ]]; then
-    for tool in account-limits list-sessions; do
+    for tool in account-limits list-sessions session-title; do
         src="$claude_bridge/isolation/tools/$tool"
         [[ -f $src ]] || die "missing bridge tool: $src"
         write_file "$src" "/opt/telegram-ai/tools/$tool" 0755
