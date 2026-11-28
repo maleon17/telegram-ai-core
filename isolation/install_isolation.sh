@@ -7,11 +7,11 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 bridge_user= bridge_group= tenants_root=/srv/ai-tenants claude_bridge= codex_bot=
 image_size=20G disk_quota_gb=4 inodes=1000000 memory_max=3G tenants_memory_max=7G
-hidepid=0 install_clis=0 no_packages=0 dry_run=0 check=0 yes=0 destdir=
+hidepid=0 install_clis=0 no_packages=0 dry_run=0 check=0 yes=0 destdir= admin_ids=
 
 while (($#)); do
     case "$1" in
-        --bridge-user|--bridge-group|--tenants-root|--claude-bridge|--codex-bot|--image-size|--disk-quota-gb|--inodes|--memory-max|--tenants-memory-max|--destdir)
+        --bridge-user|--bridge-group|--tenants-root|--claude-bridge|--codex-bot|--image-size|--disk-quota-gb|--inodes|--memory-max|--tenants-memory-max|--admin-ids|--destdir)
             (($# >= 2)) || die "$1 requires an argument"
             case "$1" in
                 --bridge-user) bridge_user=$2;; --bridge-group) bridge_group=$2;;
@@ -19,6 +19,7 @@ while (($#)); do
                 --codex-bot) codex_bot=$2;; --image-size) image_size=$2;;
                 --disk-quota-gb) disk_quota_gb=$2;; --inodes) inodes=$2;;
                 --memory-max) memory_max=$2;; --tenants-memory-max) tenants_memory_max=$2;;
+                --admin-ids) admin_ids=$2;;
                 --destdir) destdir=$2;;
             esac
             shift 2;;
@@ -39,6 +40,7 @@ done
 [[ $disk_quota_gb =~ ^[0-9]+$ && $disk_quota_gb -gt 0 ]] || die 'invalid disk quota'
 [[ $inodes =~ ^[0-9]+$ && $inodes -gt 0 ]] || die 'invalid inode limit'
 [[ $memory_max =~ ^[0-9]+[GM]$ && $tenants_memory_max =~ ^[0-9]+[GM]$ ]] || die 'memory limits require a number and G or M'
+[[ -z $admin_ids || $admin_ids =~ ^[0-9]{5,15}(,[0-9]{5,15})*$ ]] || die '--admin-ids must be comma separated ids of 5 to 15 digits'
 for path in "$tenants_root" "$claude_bridge" "$codex_bot" "$destdir"; do
     [[ -z $path || ( $path =~ ^/[A-Za-z0-9_./+-]+$ && $path != */../* && $path != */./* && $path != *'/..' && $path != *'/.' && $path != *'//'*) ]] || die "unsafe path: $path"
 done
@@ -66,7 +68,7 @@ render() {
         -e "s|@MEMORY_MAX@|$memory_max|g" -e "s|@TENANTS_MEMORY_MAX@|$tenants_memory_max|g" \
         -e "s|@TENANT_MEMORY_HIGH@|$tenant_memory_high|g" \
         -e "s|@TENANTS_MEMORY_HIGH@|$tenants_memory_high|g" \
-        -e "s|@MOUNT_DEPENDENCY@|$mount_dependency|g" "$src"
+        -e "s|@MOUNT_DEPENDENCY@|$mount_dependency|g" -e "s|@ADMIN_IDS@|$admin_ids|g" "$src"
 }
 write_file() {
     local src=$1 path=$2 mode=$3 dst tmp
@@ -111,9 +113,9 @@ config_file() {
             if ! grep -Eq "^[[:space:]]*$key[[:space:]]*=" "$dst"; then
                 if ((check)); then note "DIFF /etc/telegram-ai/tenants.conf (missing $key)"; differences=1
                 elif ((dry_run)); then note "PLAN append $key to tenants.conf"
-                else render_line="$(printf '%s\n' "$line" | sed -e "s|@BRIDGE_USER@|$bridge_user|g" -e "s|@BRIDGE_GROUP@|$bridge_group|g" -e "s|@TENANTS_ROOT@|$tenants_root|g" -e "s|@REQUIRE_MOUNT@|$require_mount|g" -e "s|@DISK_QUOTA_KB@|$quota_kb|g" -e "s|@DISK_INODES@|$inodes|g" -e "s|@MEMORY_MAX@|$memory_max|g")"; printf '%s\n' "$render_line" >> "$tmp"; fi
+                else render_line="$(printf '%s\n' "$line" | sed -e "s|@BRIDGE_USER@|$bridge_user|g" -e "s|@BRIDGE_GROUP@|$bridge_group|g" -e "s|@TENANTS_ROOT@|$tenants_root|g" -e "s|@REQUIRE_MOUNT@|$require_mount|g" -e "s|@DISK_QUOTA_KB@|$quota_kb|g" -e "s|@DISK_INODES@|$inodes|g" -e "s|@MEMORY_MAX@|$memory_max|g" -e "s|@ADMIN_IDS@|$admin_ids|g")"; printf '%s\n' "$render_line" >> "$tmp"; fi
             else
-                desired="$(printf '%s\n' "$line" | sed -e "s|@BRIDGE_USER@|$bridge_user|g" -e "s|@BRIDGE_GROUP@|$bridge_group|g" -e "s|@TENANTS_ROOT@|$tenants_root|g" -e "s|@REQUIRE_MOUNT@|$require_mount|g" -e "s|@DISK_QUOTA_KB@|$quota_kb|g" -e "s|@DISK_INODES@|$inodes|g" -e "s|@MEMORY_MAX@|$memory_max|g")"
+                desired="$(printf '%s\n' "$line" | sed -e "s|@BRIDGE_USER@|$bridge_user|g" -e "s|@BRIDGE_GROUP@|$bridge_group|g" -e "s|@TENANTS_ROOT@|$tenants_root|g" -e "s|@REQUIRE_MOUNT@|$require_mount|g" -e "s|@DISK_QUOTA_KB@|$quota_kb|g" -e "s|@DISK_INODES@|$inodes|g" -e "s|@MEMORY_MAX@|$memory_max|g" -e "s|@ADMIN_IDS@|$admin_ids|g")"
                 actual="$(sed -n -E "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*//p" "$dst" | tail -n 1)"
                 if [[ $actual != "${desired#*=}" ]]; then
                     case $key in
@@ -179,6 +181,8 @@ if [[ -z $destdir && $check -eq 0 && $dry_run -eq 0 ]]; then
         apt-get install -y "${missing[@]}"
     fi
     getent group aitenants >/dev/null || groupadd --system aitenants
+    # administrator tenants live in their own group, which the network rules do not cover
+    if [[ -n $admin_ids ]]; then getent group aitenants-admin >/dev/null || groupadd --system aitenants-admin; fi
 fi
 
 if (( ! check && ! dry_run )); then
@@ -223,6 +227,7 @@ for unit in ai-tenants-firewall.service ai-tenants-backup.service ai-tenants-bac
 done
 write_file "$SOURCE_DIR/systemd/ai-tenants.slice.d-10-limits.conf" /etc/systemd/system/ai-tenants.slice.d/10-limits.conf 0644
 write_file "$SOURCE_DIR/systemd/ai-tenants-.slice.d-10-limits.conf" /etc/systemd/system/ai-tenants-.slice.d/10-limits.conf 0644
+write_file "$SOURCE_DIR/systemd/ai-admins.slice.d-10-limits.conf" /etc/systemd/system/ai-admins.slice.d/10-limits.conf 0644
 
 if [[ $image_size != none ]]; then
     for kind in claude codex; do

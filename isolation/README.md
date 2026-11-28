@@ -48,6 +48,7 @@ Use the actual service account and repository paths. The installer does not edit
 | `--inodes N` | `1000000` | Per-tenant hard inode quota; soft quota is 4/5 of this |
 | `--memory-max SIZE` | `3G` | Per-tenant slice and process memory ceiling |
 | `--tenants-memory-max SIZE` | `7G` | Combined tenant slice memory ceiling |
+| `--admin-ids IDS` | none | Comma separated Telegram ids that get an administrator tenant (passwordless sudo, outside the firewall group; see below) |
 | `--hidepid` | off | Add a `procview` group and mount `/proc` with `hidepid=2` |
 | `--install-clis` | off | Copy the installed `claude` CLI to `/opt/claude/bin` and install `@openai/codex` via npm under `/opt/codex` |
 | `--no-packages` | off | Require dependencies to be installed already |
@@ -74,7 +75,9 @@ The CLIs must exist at `/opt/claude/bin/claude` and `/opt/codex/bin/codex` befor
 /var/backups/ai-tenants/daily/ local tenant archives
 ```
 
-`tenant-provision` creates a locked Unix account with no privileged groups for each selected Telegram ID. Ordinary tenant delegates use the same UID and separate CLI config. The owner and any admin are trusted operators; this installer does not assign app roles or grant broad sudo to them. The bridge's service user needs only the two narrow sudoers entries installed here.
+`tenant-provision` creates a locked Unix account with no privileged groups for each selected Telegram ID. Ordinary tenant delegates use the same UID and separate CLI config. The bridge's service user needs only the two narrow sudoers entries installed here.
+
+**Administrator tenants.** `--admin-ids ID,ID` (stored as `ADMIN_IDS` in the root-owned `tenants.conf`, which only root can edit, so a compromised bridge cannot promote anybody) lists people who are trusted with the server itself. Their tenant has the same layout and is still a separate Unix user, but `tenant-provision` gives that user passwordless sudo through a `visudo`-checked `/etc/sudoers.d/94-tenant-admin-<user>` entry, puts it in the `aitenants-admin` group (not covered by the firewall table) and `tenant-run` starts its processes without `no_new_privs` (otherwise sudo would not work), with `sudo` on `PATH`, in the larger `ai-admins.slice`. **An administrator is root-equivalent**: isolation between administrators and from the server does not exist by design; this role is for the owner and co-administrators and nobody else. Removing an id from `ADMIN_IDS` and running `tenant-provision ensure` removes the sudoers entry again; `tenant-run` refuses a tenant whose sudoers entry does not match its role. The separate delegate user of an administrator stays an ordinary tenant.
 
 With the image, ext4 project ID equals the tenant UID. `tenant-provision ensure` sets the project ID and inheritance on the tree, then applies block and inode limits. It refuses to provision if the required mount is absent. The root-owned `ai-tenants.slice` and per-tenant slice drop-ins limit memory, CPU and tasks; `tenant-run` also starts each process in a scope with `MemoryMax`. These are per-process and per-tenant ceilings, not fair scheduling guarantees. On systems where AppArmor blocks unprivileged user namespaces, Codex's `bwrap` sandbox may not work; the UID remains the separation boundary.
 

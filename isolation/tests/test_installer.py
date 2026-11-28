@@ -125,6 +125,26 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("hidepid=2,gid=99998", (self.stage / "etc/fstab").read_text())
         self.assertIn("MemoryMax=5G", (self.stage / "etc/systemd/system/ai-tenants.slice.d/10-limits.conf").read_text())
 
+    def test_admin_ids_are_validated_and_rendered(self):
+        for bad in ("abc", "123", "123456,", "123456;rm"):
+            result = self.run_installer("--admin-ids", bad)
+            self.assertNotEqual(result.returncode, 0, bad)
+            self.assertIn("--admin-ids", result.stderr)
+        self.assertFalse(self.stage.exists())
+        result = self.run_installer("--admin-ids", "123456,7654321")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        conf = (self.stage / "etc/telegram-ai/tenants.conf").read_text()
+        self.assertIn("ADMIN_IDS=123456,7654321", conf)
+        self.assertIn("ADMIN_GROUP=aitenants-admin", conf)
+        self.assertNotIn("@ADMIN_IDS@", conf)
+        slice_file = self.stage / "etc/systemd/system/ai-admins.slice.d/10-limits.conf"
+        self.assertIn("MemoryMax=9G", slice_file.read_text())
+        # without the option the key stays empty: no administrator exists unless the owner asks for one
+        other = self.base / "stage2"
+        subprocess.run([str(INSTALL), "--bridge-user", pwd.getpwuid(os.getuid()).pw_name, "--destdir", str(other)],
+                       text=True, capture_output=True, check=True)
+        self.assertIn("ADMIN_IDS=\n", (other / "etc/telegram-ai/tenants.conf").read_text())
+
     def test_existing_config_only_gets_missing_keys(self):
         self.assertEqual(self.run_installer().returncode, 0)
         path = self.stage / "etc/telegram-ai/tenants.conf"
@@ -200,6 +220,114 @@ class ProvisionLogicTests(unittest.TestCase):
         with mock.patch.object(self.helper.os, "lstat", return_value=fake_stat):
             self.helper.validate_conf(conf)
         self.assertEqual(conf["_quota_kb"], 1024)
+
+
+class AdministratorRoleTests(unittest.TestCase):
+    """The administrator role: set only by the root-owned configuration, passwordless sudo through a validated
+    sudoers entry, outside the tenant firewall group, and with sudo actually usable (no no_new_privs)."""
+
+    def setUp(self):
+        self.provision = load_helper("tenant-provision")
+        self.run_helper = load_helper("tenant-run")
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(self.temp.cleanup)
+        self.sudoers = Path(self.temp.name)
+        patcher = mock.patch.object(self.provision, "SUDOERS_DIR", str(self.sudoers))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        chown = mock.patch.object(self.provision.os, "chown")
+        chown.start()
+        self.addCleanup(chown.stop)
+        self.visudo_calls = []
+
+    def fake_run(self, command):
+        self.visudo_calls.append(command)
+        return mock.Mock(returncode=0, stderr="")
+
+    def conf(self, **overrides):
+        conf = dict(self.provision.DEFAULTS, TENANTS_ROOT="/tenants", BRIDGE_GROUP="bridgeg", **overrides)
+        fake_stat = mock.Mock(st_uid=0, st_mode=stat.S_IFDIR | 0o711)
+        with mock.patch.object(self.provision.os, "lstat", return_value=fake_stat), \
+                mock.patch.object(self.provision.pwd, "getpwnam"), \
+                mock.patch.object(self.provision.grp, "getgrnam", return_value=mock.Mock(gr_gid=1234)):
+            self.provision.validate_conf(conf)
+        return conf
+
+    def test_roles_come_only_from_the_configuration(self):
+        conf = self.conf(ADMIN_IDS="123456, 654321")
+        self.assertEqual(self.provision.role_of(conf, "123456", "main"), "admin")
+        self.assertEqual(self.provision.role_of(conf, "654321", "main"), "admin")
+        self.assertEqual(self.provision.role_of(conf, "999999", "main"), "member")
+        # the separate delegate user of an administrator is an ordinary tenant
+        self.assertEqual(self.provision.role_of(conf, "123456", "delegate"), "member")
+        with self.assertRaises(SystemExit):
+            self.conf(ADMIN_IDS="12ab")
+        for bad in ("sudo", "aitenants", "bridgeg", "Bad Name"):
+            with self.assertRaises(SystemExit, msg=bad):
+                self.conf(ADMIN_GROUP=bad)
+
+    def test_sudoers_entry_is_validated_idempotent_and_revocable(self):
+        with mock.patch.object(self.provision, "run", side_effect=self.fake_run):
+            self.provision.apply_sudoers("t123456", "admin")
+            path = self.sudoers / "94-tenant-admin-t123456"
+            self.assertEqual(path.read_text(), self.provision.sudoers_text("t123456"))
+            self.assertIn("t123456 ALL=(ALL:ALL) NOPASSWD: ALL", path.read_text())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o440)
+            self.assertTrue(self.provision.sudoers_ok("t123456", "admin"))
+            self.assertFalse(self.provision.sudoers_ok("t123456", "member"))
+            checked = len(self.visudo_calls)
+            self.provision.apply_sudoers("t123456", "admin")  # already correct: no rewrite
+            self.assertEqual(len(self.visudo_calls), checked)
+            self.provision.apply_sudoers("t123456", "member")  # revoked
+            self.assertFalse(path.exists())
+            self.assertTrue(self.provision.sudoers_ok("t123456", "member"))
+
+    def test_rejected_sudoers_entry_leaves_nothing_behind(self):
+        refusing = mock.Mock(returncode=1, stderr="syntax error")
+        with mock.patch.object(self.provision, "run", return_value=refusing):
+            with self.assertRaises(SystemExit):
+                self.provision.apply_sudoers("t123456", "admin")
+        self.assertEqual(list(self.sudoers.iterdir()), [])
+
+    def test_tenant_run_gives_administrators_sudo_and_their_own_slice(self):
+        conf = dict(self.run_helper.DEFAULTS)
+        member = {"id": "654321", "product": "bridge", "env": [], "role": "member"}
+        admin = dict(member, id="123456", role="admin")
+        pw = mock.Mock(pw_dir="/srv/ai-tenants/x", pw_name="tx")
+        self.assertEqual(self.run_helper.build_env(conf, member, pw)["PATH"], self.run_helper.SAFE_PATH)
+        self.assertEqual(self.run_helper.build_env(conf, admin, pw)["PATH"], self.run_helper.ADMIN_PATH)
+        self.assertIn("/usr/sbin", self.run_helper.ADMIN_PATH)
+        commands = {}
+        for name, opts in (("member", member), ("admin", admin)):
+            with mock.patch.object(self.run_helper.os.path, "exists", return_value=True), \
+                    mock.patch.object(self.run_helper.os, "execv", side_effect=lambda binary, cmd, n=name: commands.update({n: cmd})):
+                self.run_helper.run_scope(conf, ["tenant-run", opts["id"], "--", "claude"], opts)
+        self.assertIn("--slice=ai-tenants-654321.slice", commands["member"])
+        self.assertIn("MemoryMax=3G", commands["member"])
+        self.assertIn("--slice=ai-admins.slice", commands["admin"])
+        self.assertIn("MemoryMax=8G", commands["admin"])
+
+    def test_no_new_privs_is_kept_for_members_and_dropped_for_administrators(self):
+        for role, expect_call in (("member", True), ("admin", False)):
+            libc = mock.Mock()
+            libc.prctl.return_value = 0
+            pw = mock.Mock(pw_uid=20001, pw_gid=1002, pw_dir="/srv/ai-tenants/x", pw_name="tx")
+            with mock.patch.object(self.run_helper.ctypes, "CDLL", return_value=libc), \
+                    mock.patch.object(self.run_helper.os, "setgroups"), mock.patch.object(self.run_helper.os, "setgid"), \
+                    mock.patch.object(self.run_helper.os, "setuid", side_effect=[None, PermissionError]), \
+                    mock.patch.object(self.run_helper.os, "getuid", return_value=20001), \
+                    mock.patch.object(self.run_helper.os, "geteuid", return_value=20001), \
+                    mock.patch.object(self.run_helper.os, "getgid", return_value=1002), \
+                    mock.patch.object(self.run_helper.os, "getppid", return_value=2), \
+                    mock.patch.object(self.run_helper.os, "umask"), mock.patch.object(self.run_helper.os, "makedirs"), \
+                    mock.patch.object(self.run_helper.os, "chdir"), mock.patch.object(self.run_helper.os, "closerange"), \
+                    mock.patch.object(self.run_helper.resource, "setrlimit"), \
+                    mock.patch.object(self.run_helper, "resolve_program", return_value="/bin/true"), \
+                    mock.patch.object(self.run_helper.os, "execve") as execve:
+                self.run_helper.drop_and_exec({}, pw, {"TMPDIR": "/tmp/x"}, "workspace", "claude", [], role)
+            called = any(c.args and c.args[0] == self.run_helper.PR_SET_NO_NEW_PRIVS for c in libc.prctl.call_args_list)
+            self.assertEqual(called, expect_call, role)
+            execve.assert_called_once()
 
 
 class MigratorInputTests(unittest.TestCase):

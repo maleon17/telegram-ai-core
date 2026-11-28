@@ -45,10 +45,16 @@ DEFAULTS = {
     "REQUIRE_MOUNT": "0",
     "DISK_QUOTA_KB": "0",
     "DISK_INODES": "0",
+    # Administrator tenants (comma separated Telegram ids): same layout, but the user gets passwordless sudo and
+    # lives in ADMIN_GROUP, which the network rules do not cover. Only root edits this file, so the bridge cannot
+    # promote anybody. Full trust in these people is the point of the role.
+    "ADMIN_IDS": "",
+    "ADMIN_GROUP": "aitenants-admin",
 }
 ID_RE = re.compile(r"^[0-9]{5,15}$")
 PREFIX_RE = re.compile(r"^[a-z][a-z0-9_-]{0,7}$")
 KINDS = ("main", "delegate")
+SUDOERS_DIR = "/etc/sudoers.d"
 # A tenant must never belong to any of these (each one is root in disguise).
 FORBIDDEN_GROUPS = {"root", "sudo", "adm", "docker", "lxd", "shadow", "disk", "wheel", "admin", "kvm", "libvirt"}
 # Fixed layout, see the plan: every entry is private to the tenant.
@@ -117,6 +123,14 @@ def validate_conf(conf):
         die("DISK_QUOTA_KB/DISK_INODES must be integers")
     if conf["_quota_kb"] < 0 or conf["_inodes"] < 0:
         die("DISK_QUOTA_KB/DISK_INODES must not be negative")
+    admins = [item.strip() for item in conf["ADMIN_IDS"].split(",") if item.strip()]
+    for item in admins:
+        if not ID_RE.fullmatch(item):
+            die("ADMIN_IDS must be a comma separated list of ids of 5 to 15 digits")
+    conf["_admins"] = frozenset(admins)
+    if (not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", conf["ADMIN_GROUP"]) or conf["ADMIN_GROUP"] in FORBIDDEN_GROUPS
+            or conf["ADMIN_GROUP"] == conf["TENANT_GROUP"] or conf["ADMIN_GROUP"] == conf["BRIDGE_GROUP"]):
+        die("ADMIN_GROUP is not acceptable")
     if conf["REQUIRE_MOUNT"] == "1" and not os.path.ismount(conf["TENANTS_ROOT"]):
         die("REQUIRE_MOUNT is on but TENANTS_ROOT is not a mount point")
     conf["_bridge_gid"] = None
@@ -145,11 +159,67 @@ def names(conf, tid, kind):
     return f"{prefix}{tid}d", os.path.join(conf["TENANTS_ROOT"], f"{tid}-delegate")
 
 
-def group_info(conf):
+def role_of(conf, tid, kind):
+    """admin only for the main user of an id listed in the root-owned configuration."""
+    return "admin" if kind == "main" and tid in conf["_admins"] else "member"
+
+
+def group_info(conf, role="member"):
+    name = conf["ADMIN_GROUP"] if role == "admin" else conf["TENANT_GROUP"]
     try:
-        return grp.getgrnam(conf["TENANT_GROUP"])
+        return grp.getgrnam(name)
     except KeyError:
-        die(f"group {conf['TENANT_GROUP']} does not exist")
+        die(f"group {name} does not exist")
+
+
+def sudoers_path(user):
+    return os.path.join(SUDOERS_DIR, f"94-tenant-admin-{user}")
+
+
+def sudoers_text(user):
+    return (f"# Administrator tenant {user}: passwordless sudo is the purpose of the role (ADMIN_IDS in tenants.conf).\n"
+            f"{user} ALL=(ALL:ALL) NOPASSWD: ALL\n")
+
+
+def sudoers_ok(user, role):
+    """Members must have no entry, administrators exactly the expected one."""
+    path = sudoers_path(user)
+    if role != "admin":
+        return not os.path.lexists(path)
+    try:
+        st = os.lstat(path)
+        with open(path, encoding="utf-8") as handle:
+            return (stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() and stat.S_IMODE(st.st_mode) == 0o440
+                    and handle.read() == sudoers_text(user))
+    except OSError:
+        return False
+
+
+def apply_sudoers(user, role):
+    path = sudoers_path(user)
+    if role != "admin":
+        if os.path.lexists(path):
+            os.unlink(path)
+            log(f"removed the administrator sudoers entry of {user}")
+        return
+    if sudoers_ok(user, role):
+        return
+    temporary = os.path.join(SUDOERS_DIR, f".94-tenant-admin-{user}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o440)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(sudoers_text(user))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chown(temporary, 0, 0)
+        res = run(["/usr/sbin/visudo", "-cf", temporary])
+        if res.returncode != 0:
+            die("visudo rejected the administrator entry: " + res.stderr.strip()[:200])
+        os.replace(temporary, path)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+    log(f"granted passwordless sudo to administrator tenant {user}")
 
 
 def check_existing_user(conf, user, home, gid):
@@ -214,6 +284,24 @@ def share_codex_auth_with_delegate(home_fd, pw):
         os.close(delegate_fd)
 
 
+def acl_exact(conf, path):
+    """True if the directory already has exactly the intended ACL: owner rwx and one traverse-only bridge entry.
+
+    Reconciling an already correct ACL (chmod resets the mask, setfacl -b drops the bridge entry) would briefly
+    lock the bridge out of the tenant home on every ensure call, so a correct state is left alone.
+    """
+    keep = ()
+    if path.startswith("/proc/self/fd/") and path[len("/proc/self/fd/"):].isdigit():
+        keep = (int(path[len("/proc/self/fd/"):]),)  # the child must inherit the descriptor it is asked to read
+    res = subprocess.run(["/usr/bin/getfacl", "-p", path], capture_output=True, text=True, env=SAFE_ENV, pass_fds=keep)
+    if res.returncode != 0 or not conf.get("BRIDGE_USER"):
+        return False
+    wanted = {"user::rwx", f"user:{conf['BRIDGE_USER']}:--x", "group::---", "mask::--x", "other::---"}
+    seen = {line.split("#")[0].strip() for line in res.stdout.splitlines()}
+    seen.discard("")
+    return seen == wanted
+
+
 def setup_exchange(conf, home_fd, pw):
     """The one place the bridge account may share with a tenant: .exchange (setgid, group = bridge group).
 
@@ -228,6 +316,8 @@ def setup_exchange(conf, home_fd, pw):
             ensure_dir(ex_fd, sub, pw.pw_uid, bgid, 0o2770)
     finally:
         os.close(ex_fd)
+    if acl_exact(conf, f"/proc/self/fd/{home_fd}"):
+        return
     # Reconcile, do not just add: drop every extended entry first so a changed BRIDGE_USER (or an ACL the
     # tenant widened itself) ends up as exactly one traverse-only entry for the current bridge account.
     for args in (["-b"], ["-m", f"u:{conf['BRIDGE_USER']}:--x"]):
@@ -267,9 +357,10 @@ def apply_disk_quota(conf, home, uid, tree_done):
 
 def provision(conf, tid, kind):
     user, home = names(conf, tid, kind)
-    ginfo = group_info(conf)
+    role = role_of(conf, tid, kind)
+    ginfo = group_info(conf, role)
     if ginfo.gr_name in FORBIDDEN_GROUPS:
-        die("TENANT_GROUP must not be a privileged group")
+        die("the tenant group must not be a privileged group")
     pw = check_existing_user(conf, user, home, ginfo.gr_gid)
     created = False
     if pw is None:
@@ -287,11 +378,20 @@ def provision(conf, tid, kind):
     if lock.returncode != 0:
         die(f"could not lock password: {lock.stderr.strip()[:200]}")
     check_not_privileged(user)
+    apply_sudoers(user, role)
 
     root_fd = open_dir_nofollow(conf["TENANTS_ROOT"])
     try:
         name = os.path.basename(home)
-        ensure_dir(root_fd, name, pw.pw_uid, pw.pw_gid, 0o700)
+        steady = False
+        try:
+            st = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            steady = (stat.S_ISDIR(st.st_mode) and st.st_uid == pw.pw_uid and st.st_gid == pw.pw_gid
+                      and acl_exact(conf, os.path.join(conf["TENANTS_ROOT"], name)))
+        except FileNotFoundError:
+            pass
+        if not steady:  # a chmod on a correct home would reset the ACL mask and lock the bridge out for a moment
+            ensure_dir(root_fd, name, pw.pw_uid, pw.pw_gid, 0o700)
         home_fd = open_dir_nofollow(name, dir_fd=root_fd)
     finally:
         os.close(root_fd)
@@ -315,7 +415,7 @@ def provision(conf, tid, kind):
     os.makedirs(reg_dir, mode=0o700, exist_ok=True)
     os.chmod(reg_dir, 0o700)
     record = {"id": tid, "kind": kind, "user": user, "uid": pw.pw_uid, "gid": pw.pw_gid,
-              "home": home, "layout_version": 1, "locked": False}
+              "home": home, "layout_version": 1, "locked": False, "role": role}
     if quota_applied:
         record["quota_kb"], record["quota_tree"] = conf["_quota_kb"], True
     tmp = os.path.join(reg_dir, f".{user}.json.tmp")
@@ -345,13 +445,15 @@ def home_acl_private(conf, home):
 
 def status(conf, tid, kind):
     user, home = names(conf, tid, kind)
-    ginfo = group_info(conf)
+    role = role_of(conf, tid, kind)
+    ginfo = group_info(conf, role)
     try:
         pw = pwd.getpwnam(user)
     except KeyError:
         return {"id": tid, "kind": kind, "user": user, "exists": False}
     info = {"id": tid, "kind": kind, "user": user, "exists": True, "uid": pw.pw_uid, "home": pw.pw_dir,
             "home_ok": pw.pw_dir == home, "group_ok": pw.pw_gid == ginfo.gr_gid,
+            "role": role, "sudoers_ok": sudoers_ok(user, role),
             "uid_in_range": conf["_lo"] <= pw.pw_uid <= conf["_hi"],
             "privileged_groups": sorted(g.gr_name for g in grp.getgrall()
                                         if user in g.gr_mem and g.gr_name in FORBIDDEN_GROUPS)}
@@ -368,13 +470,14 @@ def status(conf, tid, kind):
 
 def lock(conf, tid, kind):
     user, home = names(conf, tid, kind)
-    ginfo = group_info(conf)
+    ginfo = group_info(conf, role_of(conf, tid, kind))
     pw = check_existing_user(conf, user, home, ginfo.gr_gid)
     if pw is None:
         die(f"user {user} does not exist")
     res = run(["/usr/sbin/usermod", "-L", "-e", "1", user])
     if res.returncode != 0:
         die(f"usermod failed: {res.stderr.strip()[:200]}")
+    apply_sudoers(user, "member")  # a locked account keeps no administrator entry
     log(f"locked user {user}")
     return {"id": tid, "kind": kind, "user": user, "locked": True}
 

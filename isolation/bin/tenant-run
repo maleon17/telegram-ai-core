@@ -39,6 +39,8 @@ TOOL_RE = re.compile(r"[a-z][a-z0-9-]{1,40}")
 DEFAULTS = {
     "MEMORY_MAX": "3G",
     "TASKS_MAX": "1024",
+    "ADMIN_MEMORY_MAX": "8G",
+    "ADMIN_TASKS_MAX": "4096",
     "USE_SYSTEMD_SCOPE": "1",
     "PASS_ENV_REGEX": r"CHAT_ID|INSTANCE_ID|TOPIC_ID|EXCLUDE_MSG_ID|CLAUDE_TELEGRAM_OUTBOX|MAX_THINKING_TOKENS|DISABLE_[A-Z_]+",
 }
@@ -47,6 +49,8 @@ KEY_RE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 KINDS = ("main", "delegate")
 PRODUCTS = ("bridge", "jarvis", "delegate")
 SAFE_PATH = "/opt/claude/bin:/opt/codex/bin:/usr/local/bin:/usr/bin:/bin"
+# Administrators run real server operations through sudo, which lives in sbin.
+ADMIN_PATH = "/opt/claude/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 PR_SET_PDEATHSIG = 1
 PR_SET_NO_NEW_PRIVS = 38
@@ -159,6 +163,8 @@ def check_tenant(opts):
         problems.append("privileged groups " + ",".join(info["privileged_groups"]))
     if not info.get("dir_private_ok") or not info.get("dir_owner_ok") or info.get("dir_is_symlink"):
         problems.append("home directory mode/owner")
+    if info.get("sudoers_ok") is False:
+        problems.append("administrator sudoers entry does not match the role")
     if problems:
         die("tenant inconsistent: " + "; ".join(problems))
     shadow = subprocess.run(["/usr/bin/getent", "shadow", info["user"]], capture_output=True, text=True)
@@ -177,7 +183,7 @@ def build_env(conf, opts, pw):
     home = pw.pw_dir
     env = {
         "HOME": home, "USER": pw.pw_name, "LOGNAME": pw.pw_name, "SHELL": "/bin/bash",
-        "PATH": SAFE_PATH, "LANG": "C.UTF-8", "TMPDIR": os.path.join(home, ".private", "tmp"),
+        "PATH": ADMIN_PATH if opts.get("role") == "admin" else SAFE_PATH, "LANG": "C.UTF-8", "TMPDIR": os.path.join(home, ".private", "tmp"),
         "CLAUDE_CONFIG_DIR": os.path.join(home, f".claude-{opts['product']}"),
         "CODEX_HOME": os.path.join(home, f".codex-{opts['product']}"),
         "DISABLE_AUTOUPDATER": "1", "TENANT_EXCHANGE_DIR": os.path.join(home, ".exchange"),
@@ -199,14 +205,19 @@ def run_scope(conf, argv, opts):
         return
     if not os.path.exists(SYSTEMD_RUN):
         die("USE_SYSTEMD_SCOPE is on but systemd-run is missing")
-    cmd = [SYSTEMD_RUN, "--scope", "--quiet", "--collect", f"--slice=ai-tenants-{opts['id']}.slice",
+    if opts.get("role") == "admin":
+        # Administrators sit in their own slice with larger limits (the per-tenant slice would cap them at member size).
+        slice_name, memory, tasks = "ai-admins.slice", conf["ADMIN_MEMORY_MAX"], conf["ADMIN_TASKS_MAX"]
+    else:
+        slice_name, memory, tasks = f"ai-tenants-{opts['id']}.slice", conf["MEMORY_MAX"], conf["TASKS_MAX"]
+    cmd = [SYSTEMD_RUN, "--scope", "--quiet", "--collect", f"--slice={slice_name}",
            f"--unit=ai-tenant-{opts['id']}-{os.getpid()}",
-           "-p", f"MemoryMax={conf['MEMORY_MAX']}", "-p", f"TasksMax={conf['TASKS_MAX']}",
+           "-p", f"MemoryMax={memory}", "-p", f"TasksMax={tasks}",
            "--", "/usr/bin/python3", os.path.realpath(__file__), argv[1], "--inner"] + argv[2:]
     os.execv(SYSTEMD_RUN, cmd)
 
 
-def drop_and_exec(conf, pw, env, rel, program, args):
+def drop_and_exec(conf, pw, env, rel, program, args, role="member"):
     libc = ctypes.CDLL(None, use_errno=True)
     gid = pw.pw_gid
     os.setgroups([gid])
@@ -220,7 +231,8 @@ def drop_and_exec(conf, pw, env, rel, program, args):
         die("could regain root after dropping privileges")
     if os.getuid() == 0 or os.geteuid() == 0 or os.getgid() == 0:
         die("still running with root ids")
-    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+    # no_new_privs would make sudo useless, and sudo is exactly what an administrator tenant is for.
+    if role != "admin" and libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
         die("could not set no_new_privs")
     libc.prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
     if os.getppid() == 1:
@@ -245,11 +257,12 @@ def main(argv):
     conf = load_conf()
     opts, program, args = parse(argv)
     info, pw = check_tenant(opts)
+    opts["role"] = info.get("role", "member")
     if not opts["inner"]:
         syslog.syslog(syslog.LOG_INFO, f"run {program} for tenant {opts['id']} ({opts['kind']}/{opts['product']})")
         run_scope(conf, argv, opts)
     env = build_env(conf, opts, pw)
-    drop_and_exec(conf, pw, env, opts["cwd"], program, args)
+    drop_and_exec(conf, pw, env, opts["cwd"], program, args, opts["role"])
 
 
 if __name__ == "__main__":
