@@ -1,0 +1,2 @@
+# The bridge may create, inspect and lock tenant users through the validating helper.
+@BRIDGE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/tenant-provision ensure *, /usr/local/sbin/tenant-provision status *, /usr/local/sbin/tenant-provision lock *

@@ -1,0 +1,109 @@
+#!/usr/bin/python3
+"""tenant-firewall: keep tenants away from the local machine and the local network.
+
+Renders and applies an nftables table `inet ai_tenants` that matches the tenants' group (so a new
+tenant is covered the moment its user exists, with no rule changes). Traffic from that group may
+reach the internet and the DNS stub, but not loopback services, the LAN, the tailnet, docker
+bridges or link-local ranges. Own table: docker, tailscale and ufw tables are never touched.
+
+    tenant-firewall apply     render, check (nft -c), apply atomically
+    tenant-firewall remove    delete the table
+    tenant-firewall status    show the table (or say it is absent)
+
+Settings come from /etc/telegram-ai/tenants.conf: TENANT_GROUP and optionally
+ALLOW_LOOPBACK_TCP (comma separated ports on 127.0.0.1 that tenants may reach, for example a relay).
+"""
+import grp
+import os
+import re
+import subprocess
+import sys
+import syslog
+
+CONF_PATH = os.environ.get("TENANT_PROVISION_CONF", "/etc/telegram-ai/tenants.conf")
+NFT = "/usr/sbin/nft"
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+
+
+def die(msg, code=2):
+    syslog.syslog(syslog.LOG_ERR, "refused: " + msg)
+    print("tenant-firewall: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def load_conf():
+    conf = {"TENANT_GROUP": "aitenants", "ALLOW_LOOPBACK_TCP": ""}
+    try:
+        st = os.stat(CONF_PATH)
+    except FileNotFoundError:
+        return conf
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        die(f"{CONF_PATH} must be owned by root and not writable by others")
+    with open(CONF_PATH, encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                if key.strip() in conf:
+                    conf[key.strip()] = value.strip().strip('"').strip("'")
+    return conf
+
+
+def render(conf):
+    try:
+        gid = grp.getgrnam(conf["TENANT_GROUP"]).gr_gid
+    except KeyError:
+        die(f"group {conf['TENANT_GROUP']} does not exist")
+    ports = [p.strip() for p in conf["ALLOW_LOOPBACK_TCP"].split(",") if p.strip()]
+    if any(not re.fullmatch(r"[0-9]{1,5}", p) or not 0 < int(p) < 65536 for p in ports):
+        die("ALLOW_LOOPBACK_TCP must be a comma separated list of ports")
+    allow_ports = ""
+    if ports:
+        allow_ports = f"        ip daddr 127.0.0.1 tcp dport {{ {', '.join(ports)} }} accept\n"
+    return f"""table inet ai_tenants
+delete table inet ai_tenants
+table inet ai_tenants {{
+    chain output {{
+        type filter hook output priority filter - 5; policy accept;
+        meta skgid != {gid} return
+        ct state established,related accept
+        ip daddr 127.0.0.53 udp dport 53 accept
+        ip daddr 127.0.0.53 tcp dport 53 accept
+{allow_ports}        ip daddr {{ 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, 224.0.0.0/4, 240.0.0.0/4 }} counter reject
+        ip6 daddr {{ ::1, fc00::/7, fe80::/10, ff00::/8 }} counter reject
+    }}
+}}
+"""
+
+
+def nft(args, stdin=None):
+    return subprocess.run([NFT] + args, input=stdin, capture_output=True, text=True, env=ENV)
+
+
+def main(argv):
+    syslog.openlog("tenant-firewall", 0, syslog.LOG_AUTH)
+    if os.geteuid() != 0:
+        die("must run as root")
+    action = argv[1] if len(argv) == 2 else ""
+    if action == "apply":
+        text = render(load_conf())
+        check = nft(["-c", "-f", "-"], text)
+        if check.returncode != 0:
+            die("ruleset failed the syntax check: " + check.stderr.strip()[:300])
+        res = nft(["-f", "-"], text)
+        if res.returncode != 0:
+            die("could not apply the ruleset: " + res.stderr.strip()[:300])
+        syslog.syslog(syslog.LOG_INFO, "applied table inet ai_tenants")
+        print("applied")
+    elif action == "remove":
+        res = nft(["delete", "table", "inet", "ai_tenants"])
+        print("removed" if res.returncode == 0 else "table was not present")
+    elif action == "status":
+        res = nft(["list", "table", "inet", "ai_tenants"])
+        print(res.stdout if res.returncode == 0 else "table absent")
+    else:
+        die("usage: tenant-firewall apply|remove|status")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

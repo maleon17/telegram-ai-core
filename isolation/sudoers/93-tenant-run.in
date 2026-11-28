@@ -1,0 +1,3 @@
+# The helper validates the tenant, command and arguments. Preserve streaming IO.
+Defaults!/usr/local/sbin/tenant-run !use_pty
+@BRIDGE_USER@ ALL=(root) NOPASSWD: /usr/local/sbin/tenant-run *

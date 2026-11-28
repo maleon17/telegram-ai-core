@@ -1,0 +1,256 @@
+#!/usr/bin/python3
+"""tenant-run: run claude or codex as a tenant's unix user, with a clean environment.
+
+Root-owned helper called through a narrow sudoers rule by the bridge:
+
+    tenant-run <id> [--kind main|delegate] [--product bridge|jarvis] [--cwd REL]
+               [--env KEY=VALUE]... -- <claude|codex> [args...]
+
+What it guarantees, in this order:
+  * the tenant must exist exactly as tenant-provision made it (`status` is checked: home, group,
+    uid range, no privileged groups, private 0700 home, account not locked);
+  * only two programs can run, resolved to fixed system paths (no PATH lookup);
+  * the environment is built from scratch (HOME, CLAUDE_CONFIG_DIR, CODEX_HOME, TMPDIR in the
+    tenant's own tree); only an allowlist of caller-supplied variables is passed through;
+  * privileges are dropped for good (groups, gid, uid; regaining root is tested and must fail),
+    no_new_privs is set so setuid binaries cannot raise them again, the process is killed with its
+    parent, core dumps are off, and a systemd scope enforces memory and task limits;
+  * the working directory is chosen after the drop, so a symlink planted by the tenant can only
+    lead somewhere the tenant itself could already go.
+Any inconsistency aborts with a non-zero exit code and the program is not started: callers must
+treat that as "do not run this tenant's turn" (fail closed).
+"""
+import ctypes
+import json
+import os
+import re
+import resource
+import signal
+import subprocess
+import sys
+import syslog
+import time
+
+CONF_PATH = os.environ.get("TENANT_PROVISION_CONF", "/etc/telegram-ai/tenants.conf")
+PROVISION = "/usr/local/sbin/tenant-provision"
+PROGRAMS = {"claude": "/opt/claude/bin/claude", "codex": "/opt/codex/bin/codex"}
+TOOLS_DIR = "/opt/telegram-ai/tools"
+TOOL_RE = re.compile(r"[a-z][a-z0-9-]{1,40}")
+DEFAULTS = {
+    "MEMORY_MAX": "3G",
+    "TASKS_MAX": "1024",
+    "USE_SYSTEMD_SCOPE": "1",
+    "PASS_ENV_REGEX": r"CHAT_ID|INSTANCE_ID|TOPIC_ID|EXCLUDE_MSG_ID|CLAUDE_TELEGRAM_OUTBOX|MAX_THINKING_TOKENS|DISABLE_[A-Z_]+",
+}
+ID_RE = re.compile(r"[0-9]{5,15}")
+KEY_RE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+KINDS = ("main", "delegate")
+PRODUCTS = ("bridge", "jarvis", "delegate")
+SAFE_PATH = "/opt/claude/bin:/opt/codex/bin:/usr/local/bin:/usr/bin:/bin"
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+PR_SET_PDEATHSIG = 1
+PR_SET_NO_NEW_PRIVS = 38
+
+
+def die(msg, code=2):
+    syslog.syslog(syslog.LOG_ERR, "refused: " + msg)
+    print("tenant-run: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    try:
+        st = os.stat(CONF_PATH)
+    except FileNotFoundError:
+        return conf
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        die(f"{CONF_PATH} must be owned by root and not writable by others")
+    with open(CONF_PATH, encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip('"').strip("'")
+            if key in conf:
+                conf[key] = value
+    return conf
+
+
+def resolve_program(name):
+    """claude/codex from fixed paths, or a root-owned, non-writable tool from the tools directory."""
+    if name in PROGRAMS:
+        return PROGRAMS[name]
+    if not TOOL_RE.fullmatch(name):
+        die("only claude, codex and installed tools can be run")
+    path = os.path.join(TOOLS_DIR, name)
+    try:
+        st = os.lstat(path)
+        dst = os.lstat(TOOLS_DIR)
+    except FileNotFoundError:
+        die("only claude, codex and installed tools can be run")
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022 or not st.st_mode & 0o111:
+        die(f"tool {name} is not a root-owned, non-writable executable")
+    if not _stat.S_ISDIR(dst.st_mode) or dst.st_uid != 0 or dst.st_mode & 0o022:
+        die("the tools directory must be root-owned and not writable by others")
+    return path
+
+
+def parse(argv):
+    args = argv[1:]
+    if "--" not in args:
+        die("usage: tenant-run <id> [options] -- <claude|codex> [args...]")
+    split = args.index("--")
+    head, tail = args[:split], args[split + 1:]
+    if not head or not tail:
+        die("usage: tenant-run <id> [options] -- <claude|codex> [args...]")
+    opts = {"id": head[0], "kind": "main", "product": "bridge", "cwd": "workspace", "env": [], "inner": False}
+    i = 1
+    while i < len(head):
+        flag = head[i]
+        if flag == "--inner":
+            opts["inner"] = True
+            i += 1
+            continue
+        if flag in ("--kind", "--product", "--cwd", "--env") and i + 1 < len(head):
+            value = head[i + 1]
+            if flag == "--env":
+                opts["env"].append(value)
+            else:
+                opts[flag[2:]] = value
+            i += 2
+            continue
+        die(f"unexpected option {flag!r}")
+    if not ID_RE.fullmatch(opts["id"]):
+        die("the id must be 5 to 15 digits")
+    if opts["kind"] not in KINDS:
+        die("unknown --kind")
+    if opts["product"] not in PRODUCTS:
+        die("unknown --product")
+    rel = opts["cwd"]
+    if os.path.isabs(rel) or ".." in rel.split("/") or "\0" in rel or not rel:
+        die("--cwd must be a relative path inside the tenant home")
+    program = tail[0]
+    resolve_program(program)
+    for arg in tail[1:]:
+        if "\0" in arg:
+            die("NUL in an argument")
+    return opts, program, tail[1:]
+
+
+def check_tenant(opts):
+    res = subprocess.run([PROVISION, "status", opts["id"], "--kind", opts["kind"]],
+                         capture_output=True, text=True, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
+    if res.returncode != 0:
+        die("tenant-provision status failed: " + res.stderr.strip()[:200])
+    info = json.loads(res.stdout)
+    if not info.get("exists"):
+        die(f"tenant {opts['id']} has no user yet (run tenant-provision ensure first)")
+    problems = []
+    if not info.get("home_ok"):
+        problems.append("home")
+    if not info.get("group_ok"):
+        problems.append("primary group")
+    if not info.get("uid_in_range"):
+        problems.append("uid range")
+    if info.get("privileged_groups"):
+        problems.append("privileged groups " + ",".join(info["privileged_groups"]))
+    if not info.get("dir_private_ok") or not info.get("dir_owner_ok") or info.get("dir_is_symlink"):
+        problems.append("home directory mode/owner")
+    if problems:
+        die("tenant inconsistent: " + "; ".join(problems))
+    shadow = subprocess.run(["/usr/bin/getent", "shadow", info["user"]], capture_output=True, text=True)
+    fields = shadow.stdout.strip().split(":")
+    if len(fields) > 7 and fields[7]:
+        try:
+            if int(fields[7]) <= int(time.time() // 86400):
+                die("tenant account is locked or expired")
+        except ValueError:
+            die("tenant account expiry is not readable")
+    import pwd
+    return info, pwd.getpwuid(info["uid"])
+
+
+def build_env(conf, opts, pw):
+    home = pw.pw_dir
+    env = {
+        "HOME": home, "USER": pw.pw_name, "LOGNAME": pw.pw_name, "SHELL": "/bin/bash",
+        "PATH": SAFE_PATH, "LANG": "C.UTF-8", "TMPDIR": os.path.join(home, ".private", "tmp"),
+        "CLAUDE_CONFIG_DIR": os.path.join(home, f".claude-{opts['product']}"),
+        "CODEX_HOME": os.path.join(home, f".codex-{opts['product']}"),
+        "DISABLE_AUTOUPDATER": "1", "TENANT_EXCHANGE_DIR": os.path.join(home, ".exchange"),
+    }
+    allowed = re.compile(conf["PASS_ENV_REGEX"])
+    for item in opts["env"]:
+        key, sep, value = item.partition("=")
+        if not sep or not KEY_RE.fullmatch(key) or not allowed.fullmatch(key):
+            die(f"environment variable {key!r} is not allowed")
+        if len(value) > 4096 or "\0" in value:
+            die(f"value of {key} is not acceptable")
+        env[key] = value
+    return env
+
+
+def run_scope(conf, argv, opts):
+    """Re-exec inside a transient systemd scope that enforces memory/task limits."""
+    if conf["USE_SYSTEMD_SCOPE"] != "1":
+        return
+    if not os.path.exists(SYSTEMD_RUN):
+        die("USE_SYSTEMD_SCOPE is on but systemd-run is missing")
+    cmd = [SYSTEMD_RUN, "--scope", "--quiet", "--collect", f"--slice=ai-tenants-{opts['id']}.slice",
+           f"--unit=ai-tenant-{opts['id']}-{os.getpid()}",
+           "-p", f"MemoryMax={conf['MEMORY_MAX']}", "-p", f"TasksMax={conf['TASKS_MAX']}",
+           "--", "/usr/bin/python3", os.path.realpath(__file__), argv[1], "--inner"] + argv[2:]
+    os.execv(SYSTEMD_RUN, cmd)
+
+
+def drop_and_exec(conf, pw, env, rel, program, args):
+    libc = ctypes.CDLL(None, use_errno=True)
+    gid = pw.pw_gid
+    os.setgroups([gid])
+    os.setgid(gid)
+    os.setuid(pw.pw_uid)
+    try:
+        os.setuid(0)
+    except PermissionError:
+        pass
+    else:
+        die("could regain root after dropping privileges")
+    if os.getuid() == 0 or os.geteuid() == 0 or os.getgid() == 0:
+        die("still running with root ids")
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        die("could not set no_new_privs")
+    libc.prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+    if os.getppid() == 1:
+        os._exit(1)
+    os.umask(0o007)
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (8192, 8192))
+    try:
+        os.makedirs(env["TMPDIR"], mode=0o700, exist_ok=True)
+        os.chdir(os.path.join(pw.pw_dir, rel))
+    except OSError as exc:
+        die(f"cannot prepare the working directory: {exc.strerror}")
+    os.closerange(3, 4096)
+    path = resolve_program(program)
+    os.execve(path, [path] + args, env)
+
+
+def main(argv):
+    syslog.openlog("tenant-run", 0, syslog.LOG_AUTH)
+    if os.geteuid() != 0:
+        die("must run as root")
+    conf = load_conf()
+    opts, program, args = parse(argv)
+    info, pw = check_tenant(opts)
+    if not opts["inner"]:
+        syslog.syslog(syslog.LOG_INFO, f"run {program} for tenant {opts['id']} ({opts['kind']}/{opts['product']})")
+        run_scope(conf, argv, opts)
+    env = build_env(conf, opts, pw)
+    drop_and_exec(conf, pw, env, opts["cwd"], program, args)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

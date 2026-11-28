@@ -1,0 +1,434 @@
+#!/usr/bin/python3
+"""m1-migrate-tenant: copy one existing tenant's data into the isolated layout.
+
+Run as root (through sudo). It COPIES; the old accounts are never modified or deleted, so the migration
+can be rolled back by switching the flag off. Sub-commands:
+
+    plan   <id>           print what would be copied and rewritten (changes nothing)
+    backup <id>           root-only archives of both old accounts and of the tenant's state entries
+    copy   <id> --yes     create the tenant (tenant-provision ensure) and copy the data into it
+    verify <id>           compare the result with the sources
+
+Mapping (Claude bridge account -> tenant): credentials and .claude.json (MCP servers removed) to .claude-bridge/,
+projects/ with the working-directory slug renamed to the tenant workspace, the live SunDay-style project folder
+(optional --project NAME) to workspace/NAME, CLAUDE.md to the bridge's control zone as persona.md.
+(Codex bridge account -> tenant): auth.json, config.toml (MCP servers and /home trust entries removed), sessions/ and the
+SQLite state databases (consistent copies) to .codex-bridge/, AGENTS.md to the Codex bridge's control zone.
+Regenerable material (plugins, caches, logs, snapshots, outbox, backups) is not copied.
+"""
+import argparse, json, os, pwd, re, shutil, sqlite3, subprocess, sys, tarfile, time
+
+HOME = ""
+BRIDGES = {}
+TENANTS_ROOT = "/srv/ai-tenants"
+BACKUP_ROOT = "/var/backups/ai-tenants"
+CLAUDE_FILES = [".credentials.json"]
+CLAUDE_DIRS = ["sessions"]
+CODEX_SQLITE = ["state_5.sqlite", "thread_history_1.sqlite", "memories_1.sqlite", "goals_1.sqlite", "queue_1.sqlite"]
+BRIDGE_USER = ""
+
+
+def configure(args):
+    global HOME, BRIDGES, TENANTS_ROOT, BACKUP_ROOT, BRIDGE_USER
+    BRIDGE_USER = args.bridge_user
+    HOME = args.legacy_home or pwd.getpwnam(BRIDGE_USER).pw_dir
+    claude = args.claude_bridge or os.path.join(HOME, ".claude-telegram-bridge")
+    codex = args.codex_bot or os.path.join(HOME, ".codex-telegram-bot")
+    for path in (HOME, claude, codex, args.tenants_root, args.backup_root):
+        if not os.path.isabs(path) or ".." in path.split("/"):
+            die("all paths must be absolute without parent traversal")
+    TENANTS_ROOT, BACKUP_ROOT = args.tenants_root, args.backup_root
+    BRIDGES = {
+        "claude": {"account": claude + "/accounts/{id}", "control": claude + "/tenant_control/{id}",
+                   "state": claude + "/state.json"},
+        "codex": {"account": codex + "/accounts/{id}", "control": codex + "/tenant_control/{id}",
+                  "state": codex + "/state.json"},
+    }
+
+
+def old_slug():
+    return slug(HOME)
+
+
+def die(msg):
+    print("m1-migrate-tenant: " + msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def slug(path):
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def paths(tid):
+    return {k: {n: v.format(id=tid) for n, v in d.items()} for k, d in BRIDGES.items()}
+
+
+def sh(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def rewrite_toml(text):
+    """Drop [mcp_servers.*] and [projects."/home..."] tables (the bridge supplies MCP itself; old trust paths are stale)."""
+    out, skip = [], False
+    for line in text.splitlines(keepends=True):
+        header = re.match(r"^\s*\[(.+?)\]\s*$", line)
+        if header:
+            name = header.group(1)
+            skip = name.startswith("mcp_servers") or name.startswith('projects."' + HOME)
+        if not skip:
+            out.append(line)
+    return "".join(out)
+
+
+def rewrite_persona(text, tid, home):
+    text = text.replace("./handoff.md", f"{home}/handoff.md")
+    for old in (BRIDGES["claude"]["account"].format(id=tid), BRIDGES["codex"]["account"].format(id=tid)):
+        text = text.replace(old, home)
+    return text
+
+
+def plan(tid, project):
+    p = paths(tid)
+    tenant = f"{TENANTS_ROOT}/{tid}"
+    lines = []
+    for kind in ("claude", "codex"):
+        src = p[kind]["account"]
+        lines.append(f"{kind} account: {src} ({'present' if os.path.isdir(src) else 'MISSING'})")
+    lines += [
+        f"tenant home: {tenant} (tenant-provision ensure {tid})",
+        f"CLAUDE  .credentials.json, sessions/, projects/ (slug {old_slug()} -> {slug(tenant + '/workspace')}) -> {tenant}/.claude-bridge/",
+        f"CLAUDE  .claude.json (mcpServers emptied) -> {tenant}/.claude-bridge/.claude.json",
+        f"CLAUDE  CLAUDE.md -> control zone {p['claude']['control']}/persona.md (+ markers), handoff.md -> {tenant}/.claude-bridge/handoff.md",
+        f"CODEX   auth.json, sessions/, {', '.join(CODEX_SQLITE)} -> {tenant}/.codex-bridge/",
+        f"CODEX   config.toml (mcp_servers / /home trust tables removed) -> {tenant}/.codex-bridge/config.toml",
+        f"CODEX   AGENTS.md -> control zone {p['codex']['control']}/persona.md, handoff.md -> {tenant}/.codex-bridge/handoff.md",
+    ]
+    if project:
+        lines.append(f"PROJECT {p['claude']['account']}/{project} -> {tenant}/workspace/{project}")
+    lines.append("NOT copied: plugins, cache, .tmp, logs, shell-snapshots, session-env, backups, outbox, models_cache.json")
+    print("\n".join(lines))
+
+
+def backup(tid):
+    p = paths(tid)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = f"{BACKUP_ROOT}/{tid}-{stamp}"
+    os.makedirs(dest, mode=0o700, exist_ok=True)
+    os.chmod(BACKUP_ROOT, 0o700)
+    for kind in ("claude", "codex"):
+        src = p[kind]["account"]
+        if os.path.isdir(src):
+            with tarfile.open(f"{dest}/{kind}-account.tar.gz", "w:gz") as tar:
+                tar.add(src, arcname=os.path.basename(src))
+    entries = {}
+    for kind in ("claude", "codex"):
+        try:
+            data = json.load(open(p[kind]["state"], encoding="utf-8"))
+            entries[kind] = (data.get("chats") or data).get(tid)
+        except (OSError, ValueError):
+            entries[kind] = None
+    json.dump(entries, open(f"{dest}/state-entries.json", "w"), ensure_ascii=False, indent=1)
+    for name in os.listdir(dest):
+        os.chmod(f"{dest}/{name}", 0o600)
+    print("backup written to", dest)
+    for name in sorted(os.listdir(dest)):
+        print(f"  {name} {os.path.getsize(dest + '/' + name)} bytes")
+
+
+def copy(tid, project):
+    p = paths(tid)
+    tenant = f"{TENANTS_ROOT}/{tid}"
+    res = sh(["/usr/local/sbin/tenant-provision", "ensure", tid])
+    if res.returncode:
+        die("tenant-provision failed: " + res.stderr.strip())
+    info = json.loads(res.stdout)
+    uid, gid = info["uid"], info["gid"]
+    cdst, xdst, wdst = f"{tenant}/.claude-bridge", f"{tenant}/.codex-bridge", f"{tenant}/workspace"
+    csrc, xsrc = p["claude"]["account"], p["codex"]["account"]
+
+    def cp(src, dst):
+        """Idempotent: a directory is merged into an existing one (a second run adds, it does not nest)."""
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        try:
+            if os.path.isdir(src) and not os.path.islink(src):
+                shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst, follow_symlinks=False)
+        except (OSError, shutil.Error) as exc:
+            die(f"copy failed: {src}: {exc}")
+
+    # --- Claude ---
+    for name in CLAUDE_FILES:
+        if os.path.exists(f"{csrc}/{name}"):
+            cp(f"{csrc}/{name}", f"{cdst}/{name}")
+    for name in CLAUDE_DIRS:
+        if os.path.isdir(f"{csrc}/{name}"):
+            cp(f"{csrc}/{name}", f"{cdst}/{name}")
+    if os.path.isfile(f"{csrc}/.claude.json"):
+        data = json.load(open(f"{csrc}/.claude.json", encoding="utf-8"))
+        data["mcpServers"] = {}
+        with open(f"{cdst}/.claude.json", "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+    new_slug = slug(wdst)
+    for entry in os.listdir(f"{csrc}/projects") if os.path.isdir(f"{csrc}/projects") else []:
+        target = new_slug if entry == old_slug() else entry
+        cp(f"{csrc}/projects/{entry}", f"{cdst}/projects/{target}")
+    if os.path.isfile(f"{csrc}/handoff.md"):
+        cp(f"{csrc}/handoff.md", f"{cdst}/handoff.md")
+    if project and os.path.isdir(f"{csrc}/{project}"):
+        cp(f"{csrc}/{project}", f"{wdst}/{project}")
+    # --- Codex ---
+    for name in ("auth.json",):
+        if os.path.exists(f"{xsrc}/{name}"):
+            cp(f"{xsrc}/{name}", f"{xdst}/{name}")
+    if os.path.isdir(f"{xsrc}/sessions"):
+        cp(f"{xsrc}/sessions", f"{xdst}/sessions")
+    if os.path.isfile(f"{xsrc}/config.toml"):
+        os.makedirs(xdst, exist_ok=True)
+        with open(f"{xdst}/config.toml", "w", encoding="utf-8") as fh:
+            fh.write(rewrite_toml(open(f"{xsrc}/config.toml", encoding="utf-8").read()))
+    for name in CODEX_SQLITE:
+        if os.path.exists(f"{xsrc}/{name}"):
+            os.makedirs(xdst, exist_ok=True)
+            source = sqlite3.connect(f"file:{xsrc}/{name}?mode=ro", uri=True)
+            target = sqlite3.connect(f"{xdst}/{name}")
+            with target:
+                source.backup(target)
+            if name == "state_5.sqlite":
+                # threads store absolute rollout paths into the OLD account; thread/resume fails
+                # ("failed to resolve rollout path") unless they point into the tenant's CODEX_HOME
+                with target:
+                    target.execute("update threads set rollout_path = ? || substr(rollout_path, ?) where rollout_path like ?",
+                                   (xdst + "/", len(xsrc) + 2, xsrc + "/%"))
+            source.close(); target.close()
+    if os.path.isfile(f"{xsrc}/handoff.md"):
+        cp(f"{xsrc}/handoff.md", f"{xdst}/handoff.md")
+    # --- ownership of everything that went into the tenant ---
+    for target in (cdst, xdst, wdst):
+        if os.path.exists(target):
+            sh(["chown", "-R", f"{uid}:{gid}", target])
+            sh(["chmod", "-R", "u+rwX,go-rwx", target])
+    for name in (".credentials.json",):
+        if os.path.exists(f"{cdst}/{name}"):
+            os.chmod(f"{cdst}/{name}", 0o600)
+    # --- personas into the bridges' control zones (owned by the bridge account, never by the tenant) ---
+    bridge = pwd.getpwnam(BRIDGE_USER)
+    for kind, persona_name, markers in (("claude", "CLAUDE.md", (".persona_default_sha256", ".workspace_rules_seeded")),
+                                        ("codex", "AGENTS.md", (".persona_default_sha256",))):
+        src, ctl = p[kind]["account"], p[kind]["control"]
+        if not os.path.isfile(f"{src}/{persona_name}"):
+            continue
+        os.makedirs(ctl, mode=0o700, exist_ok=True)
+        persona_home = cdst if kind == "claude" else xdst
+        text = rewrite_persona(open(f"{src}/{persona_name}", encoding="utf-8").read(), tid, persona_home)
+        with open(f"{ctl}/persona.md", "w", encoding="utf-8") as fh:
+            fh.write(text)
+        for marker in markers:
+            if os.path.exists(f"{src}/{marker}"):
+                shutil.copyfile(f"{src}/{marker}", f"{ctl}/{marker}")
+        # the shared parent (tenant_control/) may have been created by this root-run tool: the bridge
+        # must own it, otherwise its own chmod 700 on it fails with EPERM and tenant launch breaks
+        ctl_root = os.path.dirname(ctl)
+        sh(["chown", f"{bridge.pw_uid}:{bridge.pw_gid}", ctl_root])
+        sh(["chmod", "700", ctl_root])
+        sh(["chown", "-R", f"{bridge.pw_uid}:{bridge.pw_gid}", ctl])
+        sh(["chmod", "-R", "u+rwX,go-rwx", ctl])
+        # the persona text changed, so the stored default-persona hash no longer matches: drop it (it is an optimisation)
+        marker = f"{ctl}/.persona_default_sha256"
+        if os.path.exists(marker):
+            os.unlink(marker)
+    print("copy finished for tenant", tid, "->", tenant)
+
+
+def count(path):
+    n = size = 0
+    for root, dirs, files in os.walk(path):
+        for f in files:
+            n += 1
+            try:
+                size += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return n, size
+
+
+def verify(tid, project):
+    p = paths(tid)
+    tenant = f"{TENANTS_ROOT}/{tid}"
+    ok = True
+
+    def check(label, cond, detail=""):
+        nonlocal ok
+        ok &= bool(cond)
+        print(("PASS " if cond else "FAIL ") + label + (f"  {detail}" if detail else ""))
+
+    info = json.loads(sh(["/usr/local/sbin/tenant-provision", "status", tid]).stdout or "{}")
+    check("tenant user exists and is private", info.get("exists") and info.get("dir_private_ok") and info.get("group_ok"))
+    check("no privileged groups", not info.get("privileged_groups"))
+    if project:
+        src, dst = f"{p['claude']['account']}/{project}", f"{tenant}/workspace/{project}"
+        check("project file count and size match", count(src) == count(dst), f"{count(src)} vs {count(dst)}")
+        for sub in ("workdir",):
+            a, b = f"{src}/{sub}", f"{dst}/{sub}"
+            if os.path.isdir(f"{a}/.git"):
+                ha = sh(["git", "-c", "safe.directory=*", "-C", a, "rev-parse", "HEAD"]).stdout.strip()
+                hb = sh(["git", "-c", "safe.directory=*", "-C", b, "rev-parse", "HEAD"]).stdout.strip()
+                sa = sh(["git", "-c", "safe.directory=*", "-C", a, "status", "--porcelain"]).stdout
+                sb = sh(["git", "-c", "safe.directory=*", "-C", b, "status", "--porcelain"]).stdout
+                check(f"git HEAD and status of {sub} match", ha == hb and sa == sb, f"{ha[:8]} vs {hb[:8]}")
+    old_project = f"{p['claude']['account']}/projects/{old_slug()}"
+    c_sessions = len([f for f in os.listdir(old_project) if f.endswith(".jsonl")]) if os.path.isdir(old_project) else 0
+    new = f"{tenant}/.claude-bridge/projects/{slug(tenant + '/workspace')}"
+    n_sessions = len([f for f in os.listdir(new) if f.endswith(".jsonl")]) if os.path.isdir(new) else 0
+    check("Claude sessions copied under the new slug", c_sessions == n_sessions and c_sessions > 0, f"{c_sessions} vs {n_sessions}")
+    check("Claude credentials present, mode 600", os.path.exists(f"{tenant}/.claude-bridge/.credentials.json") and
+          oct(os.stat(f"{tenant}/.claude-bridge/.credentials.json").st_mode & 0o777) == "0o600")
+    check("Codex auth.json present", os.path.exists(f"{tenant}/.codex-bridge/auth.json"))
+    for name in CODEX_SQLITE:
+        dbp = f"{tenant}/.codex-bridge/{name}"
+        if os.path.exists(dbp):
+            res = sqlite3.connect(dbp).execute("pragma integrity_check").fetchone()[0]
+            check(f"sqlite {name} integrity", res == "ok", res)
+    state_db = f"{tenant}/.codex-bridge/state_5.sqlite"
+    if os.path.exists(state_db):
+        rollouts = [r[0] for r in sqlite3.connect(state_db).execute("select rollout_path from threads")]
+        bad = [x for x in rollouts if not (x.startswith(f"{tenant}/.codex-bridge/") and os.path.isfile(x))]
+        check("Codex thread rollout paths point into the tenant home and exist", not bad, f"{len(rollouts)} threads, {len(bad)} bad")
+    cfg = open(f"{tenant}/.codex-bridge/config.toml").read() if os.path.exists(f"{tenant}/.codex-bridge/config.toml") else ""
+    check("Codex config.toml has no MCP servers or legacy-home trust entries", "mcp_servers" not in cfg and HOME not in cfg)
+    for kind in ("claude", "codex"):
+        persona = f"{p[kind]['control']}/persona.md"
+        check(f"{kind} persona in the control zone, readable only by the bridge account",
+              os.path.isfile(persona) and (os.stat(persona).st_mode & 0o077) == 0)
+    owners = {os.stat(x).st_uid for x in (f"{tenant}/.claude-bridge", f"{tenant}/.codex-bridge", f"{tenant}/workspace") if os.path.exists(x)}
+    check("copied trees belong to the tenant", owners == {info.get("uid")}, str(owners))
+    print("RESULT:", "ALL PASS" if ok else "FAILURES")
+    sys.exit(0 if ok else 1)
+
+
+def rollback(tid):
+    """Return what the tenant created after the migration to the old accounts, which were never deleted.
+
+    Claude sessions go back under the old project slug, newer Codex rollouts and the Codex databases are copied
+    back (rollout paths rewritten to the old account), a newer login replaces the old one. Nothing in the tenant
+    directory is removed. The bridges must already have the tenant out of ISOLATED_TENANTS (see the printout).
+    """
+    p = paths(tid)
+    tenant = f"{TENANTS_ROOT}/{tid}"
+    if not os.path.isdir(tenant):
+        die(f"{tenant} does not exist")
+    user = pwd.getpwuid(os.stat(tenant).st_uid).pw_name
+    if sh(["/usr/bin/pgrep", "-u", user]).returncode == 0:
+        die(f"processes of {user} are still running: take the tenant out of ISOLATED_TENANTS, restart the bridges, retry")
+    os.makedirs(BACKUP_ROOT, mode=0o700, exist_ok=True)
+    safety = f"{BACKUP_ROOT}/{tid}-rollback-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
+    with tarfile.open(safety, "w:gz") as tar:
+        tar.add(tenant, arcname=tid)
+    os.chmod(safety, 0o600)
+    print("safety archive of the tenant:", safety)
+    bridge = pwd.getpwnam(BRIDGE_USER)
+    cdst, xdst = f"{tenant}/.claude-bridge", f"{tenant}/.codex-bridge"
+    csrc, xsrc = p["claude"]["account"], p["codex"]["account"]
+    written = []
+
+    def newer_copy(src, dst):
+        """Copy a tree; a file is replaced only if missing or older (rollouts and sessions only ever grow)."""
+        for root, _dirs, files in os.walk(src):
+            rel = os.path.relpath(root, src)
+            out = dst if rel == "." else os.path.join(dst, rel)
+            os.makedirs(out, exist_ok=True)
+            for name in files:
+                a, b = os.path.join(root, name), os.path.join(out, name)
+                if os.path.islink(a):
+                    continue
+                if not os.path.exists(b) or os.path.getmtime(a) > os.path.getmtime(b):
+                    shutil.copy2(a, b)
+                    written.append(b)
+
+    # --- Claude: sessions of the workspace go back to the old home slug; a newer login replaces the old one
+    new_slug = slug(f"{tenant}/workspace")
+    if os.path.isdir(f"{cdst}/projects/{new_slug}") and os.path.isdir(csrc):
+        newer_copy(f"{cdst}/projects/{new_slug}", f"{csrc}/projects/{old_slug()}")
+    for entry in (os.listdir(f"{cdst}/projects") if os.path.isdir(f"{cdst}/projects") else []):
+        if entry != new_slug and os.path.isdir(csrc):
+            newer_copy(f"{cdst}/projects/{entry}", f"{csrc}/projects/{entry}")
+    cred = f"{cdst}/.credentials.json"
+    if os.path.isfile(cred) and os.path.isdir(csrc) and (
+            not os.path.exists(f"{csrc}/.credentials.json") or os.path.getmtime(cred) > os.path.getmtime(f"{csrc}/.credentials.json")):
+        shutil.copy2(cred, f"{csrc}/.credentials.json")
+        written.append(f"{csrc}/.credentials.json")
+    # --- Codex
+    if os.path.isdir(xsrc):
+        if os.path.isdir(f"{xdst}/sessions"):
+            newer_copy(f"{xdst}/sessions", f"{xsrc}/sessions")
+        auth = f"{xdst}/auth.json"
+        if os.path.isfile(auth) and (not os.path.exists(f"{xsrc}/auth.json") or os.path.getmtime(auth) > os.path.getmtime(f"{xsrc}/auth.json")):
+            shutil.copy2(auth, f"{xsrc}/auth.json")
+            written.append(f"{xsrc}/auth.json")
+        for name in CODEX_SQLITE:
+            if not os.path.exists(f"{xdst}/{name}"):
+                continue
+            target_path = f"{xsrc}/{name}"
+            if os.path.exists(target_path):
+                os.replace(target_path, target_path + ".pre-rollback")
+                for suffix in ("-wal", "-shm"):
+                    if os.path.exists(target_path + suffix):
+                        os.replace(target_path + suffix, target_path + ".pre-rollback" + suffix)
+            source = sqlite3.connect(f"file:{xdst}/{name}?mode=ro", uri=True)
+            target = sqlite3.connect(target_path)
+            with target:
+                source.backup(target)
+            if name == "state_5.sqlite":
+                with target:
+                    target.execute("update threads set rollout_path = ? || substr(rollout_path, ?) where rollout_path like ?",
+                                   (xsrc + "/", len(xdst) + 2, xdst + "/%"))
+            source.close(); target.close()
+            written.append(target_path)
+    for path in written:
+        os.chown(path, bridge.pw_uid, bridge.pw_gid)
+    for base in (csrc, xsrc):
+        if os.path.isdir(base):
+            sh(["chown", "-R", f"{bridge.pw_uid}:{bridge.pw_gid}", base])
+    print(f"rolled back {len(written)} files into the old accounts of tenant {tid}")
+    print("Next: remove the id from ISOLATED_TENANTS in bridge.env and in the codex-telegram-bot isolation.conf drop-in,")
+    print("systemctl daemon-reload, restart both bridges. The tenant directory is left untouched.")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("action", choices=("plan", "backup", "copy", "verify", "rollback"))
+    ap.add_argument("id")
+    ap.add_argument("--project", help="project folder inside the Claude account to place in workspace/ (e.g. SunDay)")
+    ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--bridge-user", required=True, help="Unix account that owns the existing bridge state")
+    ap.add_argument("--legacy-home", help="old workspace path (default: bridge user's home)")
+    ap.add_argument("--claude-bridge", help="existing Claude bridge directory")
+    ap.add_argument("--codex-bot", help="existing Codex bridge directory")
+    ap.add_argument("--tenants-root", default="/srv/ai-tenants")
+    ap.add_argument("--backup-root", default="/var/backups/ai-tenants")
+    a = ap.parse_args()
+    configure(a)
+    if not re.fullmatch(r"[0-9]{5,15}", a.id):
+        die("bad id")
+    if a.action != "plan" and os.geteuid() != 0:
+        die("must run as root")
+    if a.project and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}", a.project):
+        die("bad project name")
+    if a.action == "plan":
+        plan(a.id, a.project)
+    elif a.action == "backup":
+        backup(a.id)
+    elif a.action == "copy":
+        if not a.yes:
+            die("copy changes the system: add --yes after reviewing `plan`")
+        copy(a.id, a.project)
+    elif a.action == "rollback":
+        if not a.yes:
+            die("rollback overwrites files in the old accounts: add --yes (a safety archive is written first)")
+        rollback(a.id)
+    else:
+        verify(a.id, a.project)
+
+
+if __name__ == "__main__":
+    main()

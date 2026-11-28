@@ -1,0 +1,64 @@
+#!/usr/bin/python3
+"""Daily local snapshot of every tenant's data (root-run, by the ai-tenants-backup timer).
+
+One gzip tarball per tenant and day under DEST/<id>/, newest KEEP days retained. Symlinks are stored as links,
+never followed, so a tenant cannot make the archive swallow a file outside its home. Caches and the
+bridge<->tenant exchange directory are skipped. This protects against deletion and corruption, not against the
+loss of the disk: copy DEST off the machine if that matters.
+"""
+import os
+import re
+import sys
+import tarfile
+import time
+
+ROOT = os.environ.get("TENANTS_ROOT", "/srv/ai-tenants")
+DEST = os.environ.get("TENANT_BACKUP_DEST", "/var/backups/ai-tenants/daily")
+KEEP = 7
+SKIP_NAMES = {".exchange", "cache", ".cache", "node_modules", "__pycache__", ".tmp", "tmp", "shell-snapshots"}
+ID_RE = re.compile(r"^[0-9]{5,15}$")
+
+
+def snapshot(tid, stamp):
+    home = os.path.join(ROOT, tid)
+    out_dir = os.path.join(DEST, tid)
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    final = os.path.join(out_dir, f"{stamp}.tar.gz")
+    temporary = final + ".part"
+
+    def keep(info):
+        return None if os.path.basename(info.name) in SKIP_NAMES else info
+
+    with tarfile.open(temporary, "w:gz") as archive:
+        archive.add(home, arcname=tid, filter=keep)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, final)
+    old = sorted(n for n in os.listdir(out_dir) if n.endswith(".tar.gz"))[:-KEEP]
+    for name in old:
+        os.unlink(os.path.join(out_dir, name))
+    return final
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("tenant-backup: must run as root")
+    if os.environ.get("REQUIRE_MOUNT", "1") == "1" and not os.path.ismount(ROOT):
+        sys.exit(f"tenant-backup: {ROOT} is not mounted")
+    os.makedirs(DEST, mode=0o700, exist_ok=True)
+    os.chmod(DEST, 0o700)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    failures = 0
+    for tid in sorted(os.listdir(ROOT)):
+        if not ID_RE.fullmatch(tid) or not os.path.isdir(os.path.join(ROOT, tid)):
+            continue
+        try:
+            path = snapshot(tid, stamp)
+            print(f"{tid}: {path} {os.path.getsize(path)} bytes")
+        except Exception as exc:  # keep going: one broken tenant must not stop the others
+            failures += 1
+            print(f"{tid}: FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()

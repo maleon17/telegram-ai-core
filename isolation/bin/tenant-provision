@@ -1,0 +1,406 @@
+#!/usr/bin/python3
+"""tenant-provision: create and verify per-tenant unix users and directories.
+
+Root-owned helper, the privilege boundary of the tenant isolation module.
+Called through a narrow sudoers rule by the bridge. It never grants sudo and
+never accepts free-form input: the Telegram id is validated, every path is
+derived from the validated id and a root-owned config file, and every
+directory operation is done on file descriptors without following symlinks, so
+a tenant cannot redirect the helper by planting a link inside its own tree.
+
+    tenant-provision ensure <id> [--kind main|delegate]
+    tenant-provision status <id> [--kind main|delegate]
+    tenant-provision lock   <id> [--kind main|delegate]
+
+`ensure` is idempotent. Any inconsistency (user exists with another home, uid
+outside the range, membership in a privileged group, a symlink where a
+directory is expected) aborts with a non-zero exit code and changes nothing
+further: callers must treat that as "do not start this tenant's turn".
+"""
+import grp
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import syslog
+
+CONF_PATH = os.environ.get("TENANT_PROVISION_CONF", "/etc/telegram-ai/tenants.conf")
+DEFAULTS = {
+    "TENANTS_ROOT": "/srv/ai-tenants",
+    "TENANT_GROUP": "aitenants",
+    "USER_PREFIX": "t",
+    "UID_MIN": "20000",
+    "UID_MAX": "29999",
+    "REGISTRY_DIR": "/var/lib/telegram-ai/tenants",
+    "BRIDGE_USER": "",
+    "BRIDGE_GROUP": "",
+    # Optional hardening, off by default so a plain install keeps working:
+    # REQUIRE_MOUNT=1   refuse to run unless TENANTS_ROOT is its own mount point (a failed mount must not
+    #                   silently put tenant data on the root filesystem);
+    # DISK_QUOTA_KB=N   per-tenant hard block limit (ext4/xfs project quota, project id = the tenant uid);
+    # DISK_INODES=N     per-tenant hard inode limit (0 = none).
+    "REQUIRE_MOUNT": "0",
+    "DISK_QUOTA_KB": "0",
+    "DISK_INODES": "0",
+}
+ID_RE = re.compile(r"^[0-9]{5,15}$")
+PREFIX_RE = re.compile(r"^[a-z][a-z0-9_-]{0,7}$")
+KINDS = ("main", "delegate")
+# A tenant must never belong to any of these (each one is root in disguise).
+FORBIDDEN_GROUPS = {"root", "sudo", "adm", "docker", "lxd", "shadow", "disk", "wheel", "admin", "kvm", "libvirt"}
+# Fixed layout, see the plan: every entry is private to the tenant.
+HIDDEN_DIRS = (".auth", ".claude-bridge", ".claude-jarvis", ".claude-delegate", ".codex-bridge", ".codex-jarvis",
+               ".codex-delegate", ".private")
+VISIBLE_DIRS = ("workspace",)
+EXCHANGE_DIR = ".exchange"
+EXCHANGE_SUBDIRS = ("inbox", "outbox", "queue", "result")
+
+
+SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, env=SAFE_ENV)
+
+
+def log(msg):
+    syslog.syslog(syslog.LOG_INFO, msg)
+
+
+def die(msg, code=2):
+    syslog.syslog(syslog.LOG_ERR, "refused: " + msg)
+    print("tenant-provision: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    try:
+        st = os.stat(CONF_PATH)
+    except FileNotFoundError:
+        return conf
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        die(f"{CONF_PATH} must be owned by root and not writable by others")
+    with open(CONF_PATH, encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip('"').strip("'")
+            if key in conf:
+                conf[key] = value
+    return conf
+
+
+def validate_conf(conf):
+    root = conf["TENANTS_ROOT"]
+    if not os.path.isabs(root) or ".." in root.split("/") or root == "/":
+        die("TENANTS_ROOT must be a normal absolute path")
+    if not PREFIX_RE.fullmatch(conf["USER_PREFIX"]):
+        die("USER_PREFIX is not acceptable")
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", conf["TENANT_GROUP"]):
+        die("TENANT_GROUP is not acceptable")
+    try:
+        lo, hi = int(conf["UID_MIN"]), int(conf["UID_MAX"])
+    except ValueError:
+        die("UID_MIN/UID_MAX must be integers")
+    if not (1000 < lo < hi < 60000):
+        die("UID range must sit between 1000 and 60000")
+    conf["_lo"], conf["_hi"] = lo, hi
+    try:
+        conf["_quota_kb"], conf["_inodes"] = int(conf["DISK_QUOTA_KB"]), int(conf["DISK_INODES"])
+    except ValueError:
+        die("DISK_QUOTA_KB/DISK_INODES must be integers")
+    if conf["_quota_kb"] < 0 or conf["_inodes"] < 0:
+        die("DISK_QUOTA_KB/DISK_INODES must not be negative")
+    if conf["REQUIRE_MOUNT"] == "1" and not os.path.ismount(conf["TENANTS_ROOT"]):
+        die("REQUIRE_MOUNT is on but TENANTS_ROOT is not a mount point")
+    conf["_bridge_gid"] = None
+    if conf["BRIDGE_USER"] or conf["BRIDGE_GROUP"]:
+        try:
+            pwd.getpwnam(conf["BRIDGE_USER"])
+            conf["_bridge_gid"] = grp.getgrnam(conf["BRIDGE_GROUP"]).gr_gid
+        except KeyError:
+            die("BRIDGE_USER/BRIDGE_GROUP must both name existing accounts")
+        if conf["BRIDGE_GROUP"] in FORBIDDEN_GROUPS or conf["BRIDGE_GROUP"] == conf["TENANT_GROUP"]:
+            die("BRIDGE_GROUP must be a dedicated, non-privileged group")
+    try:
+        st = os.lstat(root)
+    except FileNotFoundError:
+        die(f"{root} does not exist")
+    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        die(f"{root} must be a real directory")
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        die(f"{root} must be owned by root and not writable by group/others")
+
+
+def names(conf, tid, kind):
+    prefix = conf["USER_PREFIX"]
+    if kind == "main":
+        return f"{prefix}{tid}", os.path.join(conf["TENANTS_ROOT"], tid)
+    return f"{prefix}{tid}d", os.path.join(conf["TENANTS_ROOT"], f"{tid}-delegate")
+
+
+def group_info(conf):
+    try:
+        return grp.getgrnam(conf["TENANT_GROUP"])
+    except KeyError:
+        die(f"group {conf['TENANT_GROUP']} does not exist")
+
+
+def check_existing_user(conf, user, home, gid):
+    """Return the pwd entry if the user exists and is exactly what we would create."""
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        return None
+    if pw.pw_dir != home:
+        die(f"user {user} exists with a different home ({pw.pw_dir})")
+    if pw.pw_gid != gid:
+        die(f"user {user} exists with a different primary group")
+    if not (conf["_lo"] <= pw.pw_uid <= conf["_hi"]):
+        die(f"user {user} exists with a uid outside the tenant range")
+    return pw
+
+
+def check_not_privileged(user):
+    for g in grp.getgrall():
+        if user in g.gr_mem and g.gr_name in FORBIDDEN_GROUPS:
+            die(f"user {user} is a member of the privileged group {g.gr_name}")
+    # The primary group must not be a privileged one either (checked via gid by caller).
+
+
+def open_dir_nofollow(path_or_name, dir_fd=None):
+    return os.open(path_or_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+
+
+def ensure_dir(parent_fd, name, uid, gid, mode):
+    """Create (or verify) one directory inside parent_fd without following links."""
+    try:
+        os.mkdir(name, mode, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    try:
+        fd = open_dir_nofollow(name, dir_fd=parent_fd)
+    except OSError as exc:
+        die(f"{name} is not a real directory ({exc.strerror})")
+    try:
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def share_codex_auth_with_delegate(home_fd, pw):
+    """The Codex delegate slot of a tenant shares the tenant's login (same uid, same home).
+
+    A relative symlink inside the tenant's own tree, created only when nothing is there yet:
+    an existing file or link (for example one the tenant replaced) is left alone."""
+    try:
+        delegate_fd = open_dir_nofollow(".codex-delegate", dir_fd=home_fd)
+    except OSError:
+        return
+    try:
+        try:
+            os.symlink("../.codex-bridge/auth.json", "auth.json", dir_fd=delegate_fd)
+            os.chown("auth.json", pw.pw_uid, pw.pw_gid, dir_fd=delegate_fd, follow_symlinks=False)
+        except FileExistsError:
+            pass
+    finally:
+        os.close(delegate_fd)
+
+
+def setup_exchange(conf, home_fd, pw):
+    """The one place the bridge account may share with a tenant: .exchange (setgid, group = bridge group).
+
+    The bridge account gets traverse-only (--x) access to the tenant home through an ACL applied to the
+    already opened directory, so it can reach .exchange but can neither list nor read anything else.
+    """
+    bgid = conf["_bridge_gid"]
+    ensure_dir(home_fd, EXCHANGE_DIR, pw.pw_uid, bgid, 0o2770)
+    ex_fd = open_dir_nofollow(EXCHANGE_DIR, dir_fd=home_fd)
+    try:
+        for sub in EXCHANGE_SUBDIRS:
+            ensure_dir(ex_fd, sub, pw.pw_uid, bgid, 0o2770)
+    finally:
+        os.close(ex_fd)
+    # Reconcile, do not just add: drop every extended entry first so a changed BRIDGE_USER (or an ACL the
+    # tenant widened itself) ends up as exactly one traverse-only entry for the current bridge account.
+    for args in (["-b"], ["-m", f"u:{conf['BRIDGE_USER']}:--x"]):
+        res = subprocess.run(["/usr/bin/setfacl", *args, f"/proc/self/fd/{home_fd}"],
+                             capture_output=True, text=True, env=SAFE_ENV, pass_fds=(home_fd,))
+        if res.returncode != 0:
+            die(f"setfacl failed: {res.stderr.strip()[:200]}")
+
+
+def apply_disk_quota(conf, home, uid, tree_done):
+    """Per-tenant disk limit: put the whole home tree into project <uid> and set the project's limit.
+
+    The slow tree pass runs once (tree_done comes from the registry record); afterwards new files inherit the
+    project from their directory, so only the cheap limit call is repeated. Returns True when the tree is done.
+    """
+    hard_kb, inodes = conf["_quota_kb"], conf["_inodes"]
+    if hard_kb <= 0:
+        return False
+    if not tree_done:
+        # -p (project id) works on every inode; the inherit flag +P exists only on directories.
+        # Only regular files and directories: symlinks (the shared Codex auth.json) cannot carry the attribute.
+        res = run(["/usr/bin/find", home, "-xdev", "(", "-type", "f", "-o", "-type", "d", ")",
+                   "-exec", "/usr/bin/chattr", "-p", str(uid), "{}", "+"])
+        if res.returncode != 0:
+            die(f"could not set the project id on {home}: {res.stderr.strip()[:200]}")
+        res = run(["/usr/bin/find", home, "-xdev", "-type", "d", "-exec", "/usr/bin/chattr", "+P", "{}", "+"])
+        if res.returncode != 0:
+            die(f"could not set the project inherit flag in {home}: {res.stderr.strip()[:200]}")
+    soft_kb = hard_kb * 7 // 8
+    soft_inodes = inodes * 4 // 5 if inodes else 0
+    res = run(["/usr/sbin/setquota", "-P", str(uid), str(soft_kb), str(hard_kb), str(soft_inodes), str(inodes),
+               conf["TENANTS_ROOT"]])
+    if res.returncode != 0:
+        die(f"could not set the disk quota: {res.stderr.strip()[:200]}")
+    return True
+
+
+def provision(conf, tid, kind):
+    user, home = names(conf, tid, kind)
+    ginfo = group_info(conf)
+    if ginfo.gr_name in FORBIDDEN_GROUPS:
+        die("TENANT_GROUP must not be a privileged group")
+    pw = check_existing_user(conf, user, home, ginfo.gr_gid)
+    created = False
+    if pw is None:
+        cmd = ["/usr/sbin/useradd", "-K", f"UID_MIN={conf['_lo']}", "-K", f"UID_MAX={conf['_hi']}",
+               "-M", "-d", home, "-s", "/bin/bash", "-g", ginfo.gr_name,
+               "-c", f"ai tenant {tid} ({kind})", user]
+        res = run(cmd)
+        if res.returncode != 0:
+            die(f"useradd failed: {res.stderr.strip()[:200]}")
+        created = True
+        pw = pwd.getpwnam(user)
+        log(f"created user {user} uid={pw.pw_uid}")
+    # Lock the password every time: nobody logs in as a tenant.
+    lock = run(["/usr/bin/passwd", "-l", user])
+    if lock.returncode != 0:
+        die(f"could not lock password: {lock.stderr.strip()[:200]}")
+    check_not_privileged(user)
+
+    root_fd = open_dir_nofollow(conf["TENANTS_ROOT"])
+    try:
+        name = os.path.basename(home)
+        ensure_dir(root_fd, name, pw.pw_uid, pw.pw_gid, 0o700)
+        home_fd = open_dir_nofollow(name, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+    try:
+        for sub in HIDDEN_DIRS + VISIBLE_DIRS:
+            ensure_dir(home_fd, sub, pw.pw_uid, pw.pw_gid, 0o700)
+        share_codex_auth_with_delegate(home_fd, pw)
+        if conf["_bridge_gid"] is not None:
+            setup_exchange(conf, home_fd, pw)
+    finally:
+        os.close(home_fd)
+    reg_dir = conf["REGISTRY_DIR"]
+    try:
+        with open(os.path.join(reg_dir, f"{user}.json"), encoding="utf-8") as handle:
+            previous = json.load(handle)
+    except (OSError, ValueError):
+        previous = {}
+    tree_done = previous.get("quota_kb") == conf["_quota_kb"] and bool(previous.get("quota_tree"))
+    quota_applied = apply_disk_quota(conf, home, pw.pw_uid, tree_done)
+
+    os.makedirs(reg_dir, mode=0o700, exist_ok=True)
+    os.chmod(reg_dir, 0o700)
+    record = {"id": tid, "kind": kind, "user": user, "uid": pw.pw_uid, "gid": pw.pw_gid,
+              "home": home, "layout_version": 1, "locked": False}
+    if quota_applied:
+        record["quota_kb"], record["quota_tree"] = conf["_quota_kb"], True
+    tmp = os.path.join(reg_dir, f".{user}.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(record, handle)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, os.path.join(reg_dir, f"{user}.json"))
+    record["created"] = created
+    record["exchange"] = os.path.join(home, EXCHANGE_DIR) if conf["_bridge_gid"] is not None else None
+    return record
+
+
+def home_acl_private(conf, home):
+    """True if the home is private: no ACL entries except the traverse-only entry for the bridge account."""
+    res = subprocess.run(["/usr/bin/getfacl", "-p", home], capture_output=True, text=True, env=SAFE_ENV)
+    if res.returncode != 0:
+        return False
+    allowed = {"user::rwx", "group::---", "other::---", "mask::--x", "mask::---"}
+    if conf.get("BRIDGE_USER"):
+        allowed.add(f"user:{conf['BRIDGE_USER']}:--x")
+    for line in res.stdout.splitlines():
+        line = line.split("#")[0].strip()
+        if line and line not in allowed:
+            return False
+    return True
+
+
+def status(conf, tid, kind):
+    user, home = names(conf, tid, kind)
+    ginfo = group_info(conf)
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        return {"id": tid, "kind": kind, "user": user, "exists": False}
+    info = {"id": tid, "kind": kind, "user": user, "exists": True, "uid": pw.pw_uid, "home": pw.pw_dir,
+            "home_ok": pw.pw_dir == home, "group_ok": pw.pw_gid == ginfo.gr_gid,
+            "uid_in_range": conf["_lo"] <= pw.pw_uid <= conf["_hi"],
+            "privileged_groups": sorted(g.gr_name for g in grp.getgrall()
+                                        if user in g.gr_mem and g.gr_name in FORBIDDEN_GROUPS)}
+    try:
+        st = os.lstat(home)
+        info["dir_mode"] = oct(stat.S_IMODE(st.st_mode))
+        info["dir_owner_ok"] = st.st_uid == pw.pw_uid
+        info["dir_is_symlink"] = stat.S_ISLNK(st.st_mode)
+        info["dir_private_ok"] = (not stat.S_ISLNK(st.st_mode)) and home_acl_private(conf, home)
+    except FileNotFoundError:
+        info["dir_mode"] = None
+    return info
+
+
+def lock(conf, tid, kind):
+    user, home = names(conf, tid, kind)
+    ginfo = group_info(conf)
+    pw = check_existing_user(conf, user, home, ginfo.gr_gid)
+    if pw is None:
+        die(f"user {user} does not exist")
+    res = run(["/usr/sbin/usermod", "-L", "-e", "1", user])
+    if res.returncode != 0:
+        die(f"usermod failed: {res.stderr.strip()[:200]}")
+    log(f"locked user {user}")
+    return {"id": tid, "kind": kind, "user": user, "locked": True}
+
+
+def main(argv):
+    syslog.openlog("tenant-provision", 0, syslog.LOG_AUTH)
+    os.umask(0o077)
+    if os.geteuid() != 0:
+        die("must run as root")
+    args = argv[1:]
+    if len(args) < 2 or args[0] not in ("ensure", "status", "lock"):
+        die("usage: tenant-provision ensure|status|lock <id> [--kind main|delegate]")
+    action, tid, rest = args[0], args[1], args[2:]
+    kind = "main"
+    if rest:
+        if len(rest) == 2 and rest[0] == "--kind" and rest[1] in KINDS:
+            kind = rest[1]
+        else:
+            die("unexpected arguments")
+    if not ID_RE.fullmatch(tid):
+        die("the id must be 5 to 15 digits")
+    conf = load_conf()
+    validate_conf(conf)
+    result = {"ensure": provision, "status": status, "lock": lock}[action](conf, tid, kind)
+    print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main(sys.argv)

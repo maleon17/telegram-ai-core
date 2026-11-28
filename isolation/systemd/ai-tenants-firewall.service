@@ -1,0 +1,13 @@
+[Unit]
+Description=Firewall rules that keep tenant users off the local machine and network
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/tenant-firewall apply
+ExecStop=/usr/local/sbin/tenant-firewall remove
+
+[Install]
+WantedBy=multi-user.target

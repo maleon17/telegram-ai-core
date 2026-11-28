@@ -24,6 +24,7 @@ This repository holds what both userbot products share, so that either one can b
 | Registry | `registry.py` | Which components are installed on this host, and where |
 | Installers | `install_relay.sh`, `register_instance.sh` | Idempotent, non-interactive; used by the product setup scripts |
 | Userbot host | `deploy/userbot/`, `scripts/setup_userbot_network.sh` | Local Docker userbot, or Tailscale for a remote one |
+| Optional tenant isolation | [`isolation/`](isolation/README.md) | Opt-in Unix UID isolation installer, helpers and tests for the bridges |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
